@@ -422,6 +422,298 @@ Callback fires with modified headers:
 Application sends request with modified headers via its own gRPC/HTTP client
 ```
 
+## Client-Side Extensibility
+
+The previous sections describe **server-enforced** behavior — the control plane pushes config and
+the library executes it. But real-world adoption requires that applications can also **override,
+extend, and hook into** the library's behavior. Without escape hatches, developers won't adopt it.
+
+The extensibility model follows a principle: **the server sets defaults, the client can override**.
+This mirrors Envoy's own model where route-level config can override cluster-level config.
+
+### 1. LB Policy Override
+
+The server configures LB policy per cluster via CDS (e.g., round-robin, ring-hash). The client
+library should allow applications to override this at multiple levels:
+
+#### a. Engine-Level Default Override
+
+Set at build time, applies to all clusters unless the server or a per-call override says otherwise.
+
+```cpp
+auto client = ClientEngineBuilder()
+    .setXdsServer("xds.example.com", 443)
+    // Override: always use round-robin regardless of server config
+    .setDefaultLbPolicy("envoy.load_balancing_policies.round_robin")
+    .build();
+```
+
+#### b. Per-Cluster Override
+
+Override LB policy for a specific cluster, leaving others server-configured.
+
+```cpp
+auto client = ClientEngineBuilder()
+    .setXdsServer("xds.example.com", 443)
+    // Only override LB for this specific cluster
+    .setClusterLbPolicy("my-latency-sensitive-service",
+                         "envoy.load_balancing_policies.least_request")
+    .build();
+```
+
+#### c. Per-Request Override (via Request Context)
+
+At pick time, the application can influence the LB decision:
+
+```cpp
+// Override host: pin to a specific endpoint (e.g., for debugging, canary, or session stickiness)
+envoy_client_request_context ctx;
+ctx.override_host = "10.0.1.5:8080";       // bypass LB, pick this endpoint directly
+ctx.override_host_strict = false;           // fall back to LB if host is unhealthy
+
+// Hash key: provide an application-level hash for consistent hashing
+ctx.hash_key = session_id;                  // stick user to same endpoint
+ctx.hash_key_len = strlen(session_id);
+
+// Metadata match: subset LB — only pick endpoints matching these labels
+ctx.metadata = &canary_metadata;            // e.g., {"canary": "true"}
+```
+
+#### d. LB Policy Override Precedence
+
+```
+Per-request override_host  (highest priority — bypasses LB entirely)
+    ↓
+Per-request hash_key / metadata_match  (influences LB decision)
+    ↓
+Per-cluster client override  (setClusterLbPolicy)
+    ↓
+Engine-level client default  (setDefaultLbPolicy)
+    ↓
+Server-configured LB policy via CDS  (lowest priority — the default)
+```
+
+This maps to how Envoy itself resolves LB decisions: `LoadBalancerContext::overrideHostToSelect()`
+has highest priority, then `computeHashKey()` and `metadataMatchCriteria()` influence the algorithm,
+and the cluster config determines the algorithm itself.
+
+### 2. Client Interceptors
+
+Interceptors are lightweight application-level hooks that run **around** the server-enforced filter
+chain. They are simpler than full Envoy filters — just callbacks that see headers and can modify them.
+
+This is inspired by Envoy Mobile's `PlatformBridgeFilter` pattern, but simplified for the
+client library's headers-only model.
+
+#### Interceptor Interface (C++)
+
+```cpp
+// client/library/cc/interceptor.h
+
+class ClientInterceptor {
+public:
+  virtual ~ClientInterceptor() = default;
+
+  // Called BEFORE server-enforced filters run on the request.
+  // Return CONTINUE to proceed, DENY to short-circuit with an error.
+  virtual InterceptorStatus onRequestHeaders(Http::RequestHeaderMap& headers,
+                                              const StreamInfo::StreamInfo& info) {
+    return InterceptorStatus::Continue;
+  }
+
+  // Called AFTER server-enforced filters have completed on the request.
+  // The headers now include all server-filter mutations (auth tokens, etc.)
+  virtual InterceptorStatus onRequestHeadersComplete(Http::RequestHeaderMap& headers,
+                                                      const StreamInfo::StreamInfo& info) {
+    return InterceptorStatus::Continue;
+  }
+
+  // Called BEFORE server-enforced filters run on the response.
+  virtual InterceptorStatus onResponseHeaders(Http::ResponseHeaderMap& headers,
+                                               const StreamInfo::StreamInfo& info) {
+    return InterceptorStatus::Continue;
+  }
+
+  // Called AFTER server-enforced filters have completed on the response.
+  virtual InterceptorStatus onResponseHeadersComplete(Http::ResponseHeaderMap& headers,
+                                                       const StreamInfo::StreamInfo& info) {
+    return InterceptorStatus::Continue;
+  }
+};
+```
+
+#### Interceptor Registration
+
+```cpp
+auto client = ClientEngineBuilder()
+    .setXdsServer("xds.example.com", 443)
+    // Add interceptors (executed in registration order)
+    .addInterceptor("tracing", std::make_shared<TracingInterceptor>(tracer))
+    .addInterceptor("metrics", std::make_shared<MetricsInterceptor>(stats))
+    .addInterceptor("app-headers", std::make_shared<AppHeaderInterceptor>())
+    .build();
+```
+
+#### Execution Order
+
+```
+Application calls: apply_request_filters("my-service", headers)
+    │
+    ▼
+┌── Client Interceptors: onRequestHeaders() ──┐
+│   1. TracingInterceptor  → adds trace-id     │
+│   2. MetricsInterceptor → records start time │
+│   3. AppHeaderInterceptor → adds x-app-ver   │
+└──────────────┬───────────────────────────────┘
+               │
+               ▼
+┌── Server-Enforced Filter Chain ──────────────┐
+│   1. RBAC           → policy check           │
+│   2. ext_authz      → external authorization │
+│   3. header_mutation → server-mandated headers│
+│   4. credential_injector → OAuth token       │
+└──────────────┬───────────────────────────────┘
+               │
+               ▼
+┌── Client Interceptors: onRequestHeadersComplete() ─┐
+│   1. TracingInterceptor  → adds final span info     │
+│   2. MetricsInterceptor → no-op                     │
+│   3. AppHeaderInterceptor → no-op                   │
+└──────────────┬──────────────────────────────────────┘
+               │
+               ▼
+Callback fires with final headers
+```
+
+#### Interceptor via C ABI
+
+For language bindings that can't use the C++ interceptor interface:
+
+```c
+// C ABI interceptor callback
+typedef envoy_client_status (*envoy_client_interceptor_cb)(
+    envoy_client_headers* headers,         // mutable — interceptor can modify
+    const char* cluster_name,
+    uint32_t phase,                        // 0=pre_request, 1=post_request,
+                                           // 2=pre_response, 3=post_response
+    void* context
+);
+
+// Register an interceptor
+envoy_client_status envoy_client_add_interceptor(
+    envoy_client_handle handle,
+    const char* name,
+    envoy_client_interceptor_cb callback,
+    void* context
+);
+
+// Remove an interceptor
+envoy_client_status envoy_client_remove_interceptor(
+    envoy_client_handle handle,
+    const char* name
+);
+```
+
+### 3. LB Context Callback
+
+For advanced use cases, the application can register a callback that the library invokes during
+endpoint selection. This lets the app provide dynamic, per-request context to the LB algorithm
+without having to set it on every `request_context` struct.
+
+```c
+// LB context provider callback — called during pick_endpoint
+typedef void (*envoy_client_lb_context_cb)(
+    const char* cluster_name,
+    envoy_client_request_context* ctx,     // mutable — callback can enrich
+    void* context
+);
+
+// Register a global LB context provider
+envoy_client_status envoy_client_set_lb_context_provider(
+    envoy_client_handle handle,
+    envoy_client_lb_context_cb callback,
+    void* context
+);
+```
+
+**Use cases:**
+- Inject session affinity keys from thread-local storage
+- Add locality preferences based on current datacenter detection
+- Dynamically exclude endpoints based on circuit-breaker state the app tracks
+- Enrich metadata for subset routing based on runtime feature flags
+
+### 4. Client-Side Filter Injection
+
+Beyond simple interceptors, advanced users may want to inject **full Envoy filters** that run
+alongside server-pushed filters. This follows Envoy Mobile's `addNativeFilter` pattern.
+
+```cpp
+auto client = ClientEngineBuilder()
+    .setXdsServer("xds.example.com", 443)
+    // Inject a native Envoy filter (runs as part of the filter chain)
+    .addNativeFilter("envoy.filters.http.lua",
+                      R"pb(inline_code: "function envoy_on_request(h) h:headers():add('x-lua', 'yes') end")pb")
+    // Control where client filters appear relative to server filters
+    .setFilterMergePolicy(FilterMergePolicy::CLIENT_BEFORE_SERVER)
+    .build();
+```
+
+#### Filter Merge Policies
+
+When both client-injected filters and server-pushed filters exist, the merge policy controls
+ordering:
+
+| Policy | Order | Use Case |
+|--------|-------|----------|
+| `CLIENT_BEFORE_SERVER` | Client filters → Server filters | App sets context before policy enforcement |
+| `SERVER_BEFORE_CLIENT` | Server filters → Client filters | App reacts to server-enforced mutations |
+| `CLIENT_WRAPS_SERVER` | Client pre → Server filters → Client post | **Default.** Client observes both input and output |
+| `CLIENT_ONLY` | Only client filters (ignore server) | Testing, local development |
+| `SERVER_ONLY` | Only server filters (ignore client) | Strict server control, compliance |
+
+`CLIENT_WRAPS_SERVER` is the default because it's the most flexible: interceptors see headers both
+before and after server filters run, and injected native filters can be placed at either end.
+
+### 5. xDS Watch Callbacks
+
+Applications may want to react to xDS config changes — not just consume the final resolved
+endpoints, but observe when clusters are added/removed, when filter chains change, etc.
+
+```c
+// Watch callback for config changes
+typedef void (*envoy_client_config_cb)(
+    const char* resource_type,            // "cluster", "endpoint", "route", "listener"
+    const char* resource_name,
+    uint32_t event,                       // 0=added, 1=updated, 2=removed
+    void* context
+);
+
+// Register a config change watcher
+envoy_client_status envoy_client_watch_config(
+    envoy_client_handle handle,
+    const char* resource_type,             // NULL = watch all types
+    envoy_client_config_cb callback,
+    void* context
+);
+```
+
+**Use cases:**
+- Logging/alerting when endpoints change
+- Updating application-level routing tables
+- Triggering connection pool warm-up in the application when new clusters appear
+- Debugging xDS push behavior
+
+### 6. Summary: Server vs Client Control
+
+| Capability | Server (xDS) | Client (API) | Override? |
+|------------|-------------|-------------|-----------|
+| **LB policy** | CDS cluster config | `setDefaultLbPolicy`, `setClusterLbPolicy`, per-request context | Client wins if set |
+| **Filter chain** | LDS/ECDS pushed filters | `addNativeFilter`, interceptors | Merge policy controls ordering |
+| **Endpoint selection** | EDS endpoints, health | `override_host`, `metadata_match`, LB context callback | Client can pin or filter |
+| **Route matching** | RDS route config | `match_route()` API (read-only) | Server only (client just queries) |
+| **TLS/mTLS** | SDS certificates | Bootstrap static certs | Either source |
+| **Config observability** | N/A | `watch_config()` callback | Client only (observation) |
+
 ## C ABI Surface
 
 The stable C ABI is the foundation for all language bindings. It is intentionally minimal
@@ -483,9 +775,23 @@ typedef struct {
 
 // Request metadata for LB decisions
 typedef struct {
-  envoy_client_headers* metadata;  // Key-value metadata for hash-based LB
+  envoy_client_headers* metadata;  // Key-value metadata for subset LB matching
   const char* path;                // Request path for route matching
   const char* authority;           // :authority header value
+
+  // --- Client-side LB overrides (all optional, NULL/0 = not set) ---
+
+  // Override host: bypass LB and pick this endpoint directly.
+  // Format: "ip:port" (e.g., "10.0.1.5:8080")
+  const char* override_host;
+  // If true, return UNAVAILABLE when override_host is unhealthy.
+  // If false, fall back to normal LB when override_host is unhealthy.
+  uint32_t override_host_strict;
+
+  // Hash key: provide an explicit hash for consistent-hashing LB (ring-hash, maglev).
+  // Overrides the server-configured hash policy for this request.
+  const char* hash_key;
+  size_t hash_key_len;
 } envoy_client_request_context;
 
 // Callback for async filter operations
@@ -598,6 +904,94 @@ envoy_client_status envoy_client_subscribe(
 // Free headers returned by filter callbacks.
 void envoy_client_free_headers(envoy_client_headers* headers);
 
+// --- Client Interceptors ---
+
+// Interceptor phases
+typedef enum {
+  ENVOY_CLIENT_PHASE_PRE_REQUEST = 0,   // Before server filters on request
+  ENVOY_CLIENT_PHASE_POST_REQUEST = 1,  // After server filters on request
+  ENVOY_CLIENT_PHASE_PRE_RESPONSE = 2,  // Before server filters on response
+  ENVOY_CLIENT_PHASE_POST_RESPONSE = 3, // After server filters on response
+} envoy_client_interceptor_phase;
+
+// Interceptor callback. Return ENVOY_CLIENT_OK to continue, ENVOY_CLIENT_DENIED to abort.
+typedef envoy_client_status (*envoy_client_interceptor_cb)(
+    envoy_client_headers* headers,
+    const char* cluster_name,
+    envoy_client_interceptor_phase phase,
+    void* context
+);
+
+// Register a named interceptor. Interceptors execute in registration order.
+envoy_client_status envoy_client_add_interceptor(
+    envoy_client_handle handle,
+    const char* name,
+    envoy_client_interceptor_cb callback,
+    void* context
+);
+
+// Remove a previously registered interceptor by name.
+envoy_client_status envoy_client_remove_interceptor(
+    envoy_client_handle handle,
+    const char* name
+);
+
+// --- LB Context Provider ---
+
+// Callback invoked during pick_endpoint to let the app enrich the LB context.
+// The callback can modify ctx (set hash_key, override_host, metadata, etc.)
+typedef void (*envoy_client_lb_context_cb)(
+    const char* cluster_name,
+    envoy_client_request_context* ctx,
+    void* context
+);
+
+// Set a global LB context provider. Only one can be active at a time.
+envoy_client_status envoy_client_set_lb_context_provider(
+    envoy_client_handle handle,
+    envoy_client_lb_context_cb callback,
+    void* context
+);
+
+// --- Config Watch ---
+
+typedef enum {
+  ENVOY_CLIENT_CONFIG_ADDED = 0,
+  ENVOY_CLIENT_CONFIG_UPDATED = 1,
+  ENVOY_CLIENT_CONFIG_REMOVED = 2,
+} envoy_client_config_event;
+
+// Callback for xDS config changes.
+typedef void (*envoy_client_config_cb)(
+    const char* resource_type,
+    const char* resource_name,
+    envoy_client_config_event event,
+    void* context
+);
+
+// Watch for config changes. resource_type NULL = watch all types.
+envoy_client_status envoy_client_watch_config(
+    envoy_client_handle handle,
+    const char* resource_type,
+    envoy_client_config_cb callback,
+    void* context
+);
+
+// --- LB Policy Override ---
+
+// Override the LB policy for a specific cluster. Pass NULL to clear the override.
+envoy_client_status envoy_client_set_cluster_lb_policy(
+    envoy_client_handle handle,
+    const char* cluster_name,
+    const char* lb_policy_name   // e.g., "envoy.load_balancing_policies.round_robin"
+);
+
+// Set the default LB policy override for all clusters. Pass NULL to clear.
+envoy_client_status envoy_client_set_default_lb_policy(
+    envoy_client_handle handle,
+    const char* lb_policy_name
+);
+
 #ifdef __cplusplus
 }
 #endif
@@ -632,15 +1026,83 @@ func New(bootstrapYAML string) (*Client, error) {
 }
 
 // PickEndpoint selects an endpoint using the xDS-configured LB policy.
+// The RequestContext allows per-request LB overrides (hash key, override host, metadata).
 func (c *Client) PickEndpoint(cluster string, ctx *RequestContext) (*Endpoint, error) {
     // ... CGo bridge to envoy_client_pick_endpoint
 }
 
-// ApplyRequestFilters runs the server-pushed filter chain.
+// PickEndpointWithOverride bypasses LB and picks a specific endpoint.
+// Falls back to normal LB if the endpoint is unhealthy and strict=false.
+func (c *Client) PickEndpointWithOverride(cluster, host string, strict bool) (*Endpoint, error) {
+    ctx := &RequestContext{
+        OverrideHost:       host,
+        OverrideHostStrict: strict,
+    }
+    return c.PickEndpoint(cluster, ctx)
+}
+
+// ApplyRequestFilters runs interceptors + server-pushed filter chain.
 // This is async because filters like ext_authz may call external services.
 func (c *Client) ApplyRequestFilters(cluster string, headers map[string]string) (map[string]string, error) {
     // ... CGo bridge to envoy_client_apply_request_filters
     // Uses a channel to bridge async callback to sync Go call
+}
+
+// --- Client-Side Extensibility ---
+
+// Interceptor is a lightweight hook that runs around the server-enforced filter chain.
+type Interceptor interface {
+    // OnRequest is called before (phase=Pre) and after (phase=Post) server filters.
+    OnRequest(headers map[string]string, cluster string, phase Phase) error
+    // OnResponse is called before (phase=Pre) and after (phase=Post) server filters.
+    OnResponse(headers map[string]string, cluster string, phase Phase) error
+}
+
+type Phase int
+const (
+    PhasePre  Phase = iota  // Before server filters
+    PhasePost               // After server filters
+)
+
+// AddInterceptor registers a named interceptor. Interceptors execute in registration order.
+func (c *Client) AddInterceptor(name string, interceptor Interceptor) error {
+    // ... CGo bridge to envoy_client_add_interceptor
+}
+
+// RemoveInterceptor removes a previously registered interceptor.
+func (c *Client) RemoveInterceptor(name string) error {
+    // ... CGo bridge to envoy_client_remove_interceptor
+}
+
+// SetClusterLbPolicy overrides the LB policy for a specific cluster.
+func (c *Client) SetClusterLbPolicy(cluster, lbPolicy string) error {
+    // ... CGo bridge to envoy_client_set_cluster_lb_policy
+}
+
+// SetDefaultLbPolicy overrides the default LB policy for all clusters.
+func (c *Client) SetDefaultLbPolicy(lbPolicy string) error {
+    // ... CGo bridge to envoy_client_set_default_lb_policy
+}
+
+// LbContextProvider is called during endpoint selection to enrich the LB context.
+type LbContextProvider func(cluster string, ctx *RequestContext)
+
+// SetLbContextProvider registers a callback invoked during every pick_endpoint call.
+func (c *Client) SetLbContextProvider(provider LbContextProvider) error {
+    // ... CGo bridge to envoy_client_set_lb_context_provider
+}
+
+// ConfigEvent represents an xDS config change.
+type ConfigEvent struct {
+    ResourceType string // "cluster", "endpoint", "route", "listener"
+    ResourceName string
+    Event        string // "added", "updated", "removed"
+}
+
+// WatchConfig registers a callback for xDS config changes.
+// Pass empty resourceType to watch all types.
+func (c *Client) WatchConfig(resourceType string, cb func(ConfigEvent)) error {
+    // ... CGo bridge to envoy_client_watch_config
 }
 
 // Integrate with gRPC as a custom resolver + balancer
@@ -661,32 +1123,81 @@ type envoyResolver struct {
 func (r *envoyResolver) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
     // Subscribe to endpoint changes for target.URL.Host
     // On update: cc.UpdateState() with new addresses from client.Resolve()
+
+    // Watch for config changes to trigger connection pool warm-up
+    r.client.WatchConfig("endpoint", func(e ConfigEvent) {
+        if e.Event == "added" || e.Event == "updated" {
+            cc.UpdateState(/* ... */)
+        }
+    })
 }
 
-// As a gRPC balancer — uses xDS-configured LB policy
+// As a gRPC balancer — uses xDS-configured LB policy (with client overrides)
 type envoyBalancer struct {
     client *Client
 }
 
 func (b *envoyBalancer) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
-    endpoint, err := b.client.PickEndpoint(b.cluster, &RequestContext{
+    ctx := &RequestContext{
         Path: info.FullMethodName,
-    })
+    }
+
+    // Per-request LB override: if the caller set a target host in context,
+    // use override_host to pin to that endpoint (e.g., for debugging or stickiness)
+    if host, ok := info.Ctx.Value(targetHostKey{}).(string); ok {
+        ctx.OverrideHost = host
+        ctx.OverrideHostStrict = false // fall back to LB if host is unhealthy
+    }
+
+    // Per-request hash key: if the caller set a session ID, use it for
+    // consistent hashing so the same user hits the same endpoint
+    if sessionID, ok := info.Ctx.Value(sessionIDKey{}).(string); ok {
+        ctx.HashKey = sessionID
+    }
+
+    endpoint, err := b.client.PickEndpoint(b.cluster, ctx)
     // Return the subconn corresponding to this endpoint
 }
 
-// As a gRPC interceptor — runs server-enforced filters
+// As a gRPC interceptor — runs client interceptors + server-enforced filters
 func EnvoyUnaryInterceptor(client *Client) grpc.UnaryClientInterceptor {
     return func(ctx context.Context, method string, req, reply interface{},
                 cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-        // Apply request filters (may call ext_authz, inject credentials, etc.)
+        // Apply request filters:
+        // 1. Client interceptors (pre) — e.g., tracing, app headers
+        // 2. Server-enforced filters — e.g., ext_authz, credential_injector
+        // 3. Client interceptors (post) — e.g., final logging
         modifiedHeaders, err := client.ApplyRequestFilters(cluster, extractHeaders(ctx))
         if err != nil {
-            return err // Request denied by filter
+            return err // Request denied by server filter or client interceptor
         }
         ctx = injectHeaders(ctx, modifiedHeaders)
         return invoker(ctx, method, req, reply, cc, opts...)
     }
+}
+
+// Example: setting up a client with interceptors for gRPC
+func setupGRPCClient() *grpc.ClientConn {
+    client, _ := New(bootstrapYAML)
+
+    // Override LB for a specific service
+    client.SetClusterLbPolicy("payments", "envoy.load_balancing_policies.least_request")
+
+    // Add a tracing interceptor
+    client.AddInterceptor("tracing", &tracingInterceptor{tracer: otel.Tracer("grpc")})
+
+    // Provide session affinity via LB context
+    client.SetLbContextProvider(func(cluster string, ctx *RequestContext) {
+        if session := getCurrentSession(); session != nil {
+            ctx.HashKey = session.ID
+        }
+    })
+
+    conn, _ := grpc.Dial("envoy:///my-service",
+        grpc.WithResolvers(&envoyResolver{client: client}),
+        grpc.WithUnaryInterceptor(EnvoyUnaryInterceptor(client)),
+    )
+    return conn
 }
 ```
 
@@ -767,12 +1278,25 @@ auto client = ClientEngineBuilder()
     .setXdsServer("xds.example.com", 443)
     .setNodeId("frontend-client-1")
     .setClusterId("web-frontend")
+    // --- Extension allowlist (which server-pushed filters/LB the binary supports) ---
     .enableFilter("envoy.filters.http.ext_authz")
     .enableFilter("envoy.filters.http.credential_injector")
     .enableFilter("envoy.filters.http.rbac")
     .enableLbPolicy("envoy.load_balancing_policies.round_robin")
     .enableLbPolicy("envoy.load_balancing_policies.ring_hash")
     .setStatsSink("envoy.stat_sinks.statsd", statsd_config)
+    // --- Client-side overrides ---
+    // Override LB policy for a latency-sensitive service
+    .setClusterLbPolicy("payments-service",
+                         "envoy.load_balancing_policies.least_request")
+    // Inject a client-side Lua filter (runs alongside server-pushed filters)
+    .addNativeFilter("envoy.filters.http.lua",
+                      R"(inline_code: "function envoy_on_request(h) h:headers():add('x-client-version', '2.1') end")")
+    // Control client vs server filter ordering
+    .setFilterMergePolicy(FilterMergePolicy::CLIENT_WRAPS_SERVER)
+    // Register interceptors (lightweight hooks, simpler than full filters)
+    .addInterceptor("tracing", std::make_shared<TracingInterceptor>(tracer))
+    .addInterceptor("metrics", std::make_shared<MetricsInterceptor>(stats))
     .build();
 ```
 
@@ -842,6 +1366,8 @@ static_resources:
 | **Platform bindings** | Android (JNI), iOS (Swift/ObjC) | Go (CGo), Java (JNI), Python, Rust, C++ |
 | **Bootstrap** | `StrippedMainBase` + `ServerLite` | `StrippedMainBase` + `ServerClientLite` |
 | **Filters** | Full chain (request + response body) | Header-focused + async callouts |
+| **Client filters** | `addPlatformFilter` / `addNativeFilter` | `addNativeFilter` + interceptors + filter merge policy |
+| **LB override** | N/A (library picks endpoint & connects) | Per-request, per-cluster, and default LB policy overrides |
 | **Target binary size** | ~15-20MB | ~8-12MB (no codec, no conn pool for app upstreams) |
 | **ListenerManager** | API listener (no TCP accept) | Not needed |
 | **ClusterManager** | Full (owns all connections) | Reduced (filter callout connections only) |
@@ -900,21 +1426,52 @@ from injecting harmful filters?
 - C. WASM-only body filters (sandboxed, portable)
 - D. Full body support matching Envoy's filter model
 
+### 7. Client Override vs Server Authority
+
+When client-side LB overrides or filter injection conflict with server-enforced policy, who wins?
+This is a security and governance question.
+
+**Options:**
+- A. Client always wins (maximum flexibility, minimum server control)
+- B. Server can mark config as "non-overridable" via xDS metadata (server authority)
+- C. Default to client wins, but support an `authority_mode` flag in bootstrap:
+     - `CLIENT_AUTHORITY`: client overrides take effect (default, for trusted environments)
+     - `SERVER_AUTHORITY`: server overrides are immutable (for compliance/regulated environments)
+- D. Per-capability authority (e.g., server controls filters, client controls LB)
+
+### 8. Interceptor Threading Model
+
+Client interceptors run on the library's Dispatcher thread. Should the library allow interceptors
+to block (e.g., making their own network calls)?
+
+**Options:**
+- A. Interceptors must be synchronous and non-blocking (simple, safe, fast)
+- B. Support async interceptors with a callback/future model (complex but powerful)
+- C. Synchronous by default, with an opt-in async path for specific interceptors
+- D. Always dispatch interceptor callbacks to a user-provided thread pool
+
 ## Implementation Phases
 
-### Phase 1: xDS Core + Endpoint Resolution
+### Phase 1: xDS Core + Endpoint Resolution + LB Overrides
 - `ServerClientLite` bootstrap via `StrippedMainBase`
 - xDS subscriptions: CDS + EDS
 - `ConfigStore` with endpoint resolution
 - LB policy execution (round-robin, ring-hash, least-request)
-- C ABI: `create`, `destroy`, `resolve`, `pick_endpoint`, `report_result`
+- **Client-side LB overrides**: `override_host`, `hash_key`, per-cluster LB policy, default LB policy
+- **LB context provider** callback
+- **Config watch** callbacks for CDS/EDS changes
+- C ABI: `create`, `destroy`, `resolve`, `pick_endpoint`, `report_result`,
+  `set_cluster_lb_policy`, `set_default_lb_policy`, `set_lb_context_provider`, `watch_config`
 - C++ API + one language binding (Go or Java)
 
-### Phase 2: Filter Chain + Auth
+### Phase 2: Filter Chain + Auth + Interceptors
 - LDS + RDS subscriptions
 - `HeadlessFilterChain` execution
 - Synchronous filters: `header_mutation`, `credential_injector`, `rbac`
-- C ABI: `apply_request_filters`, `apply_response_filters`
+- **Client interceptors**: pre/post request and response hooks
+- **Client-side native filter injection** via `addNativeFilter`
+- **Filter merge policy**: `CLIENT_WRAPS_SERVER` (default), `CLIENT_BEFORE_SERVER`, etc.
+- C ABI: `apply_request_filters`, `apply_response_filters`, `add_interceptor`, `remove_interceptor`
 
 ### Phase 3: Async Filter Callouts
 - `ext_authz` support (gRPC + HTTP modes)
@@ -933,3 +1490,4 @@ from injecting harmful filters?
 - WASM filter support
 - Config caching for graceful degradation
 - OpenTelemetry integration
+- Server authority mode (non-overridable server config)
