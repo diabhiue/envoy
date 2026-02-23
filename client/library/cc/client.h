@@ -6,12 +6,7 @@
 #include <vector>
 
 #include "client/library/common/config_store.h"
-
-namespace Envoy {
-namespace Client {
-class ClientEngine;
-} // namespace Client
-} // namespace Envoy
+#include "client/library/common/engine_interface.h"
 
 namespace EnvoyClient {
 
@@ -130,14 +125,33 @@ public:
                    std::function<void(const ConfigEvent&)> callback);
 
   /**
+   * Record the outcome of a request for feedback-driven LB.
+   * @param address endpoint IP address.
+   * @param port endpoint port.
+   * @param status_code HTTP status code (0 = connection error).
+   * @param latency_ms request latency in milliseconds.
+   */
+  void reportResult(const std::string& address, uint32_t port, uint32_t status_code,
+                    uint64_t latency_ms);
+
+  /**
    * Shut down the client engine.
    */
   void shutdown();
 
-private:
-  explicit Client(std::unique_ptr<Envoy::Client::ClientEngine> engine);
+  /**
+   * Test-only factory: create a Client around an already-constructed engine.
+   * Not for production use.
+   */
+  static std::unique_ptr<Client>
+  createForTesting(std::unique_ptr<Envoy::Client::ClientEngineInterface> engine) {
+    return std::unique_ptr<Client>(new Client(std::move(engine)));
+  }
 
-  std::unique_ptr<Envoy::Client::ClientEngine> engine_;
+private:
+  explicit Client(std::unique_ptr<Envoy::Client::ClientEngineInterface> engine);
+
+  std::unique_ptr<Envoy::Client::ClientEngineInterface> engine_;
 };
 
 } // namespace EnvoyClient

@@ -3,6 +3,7 @@
 #include "source/server/options_impl_base.h"
 
 #include "client/library/common/engine.h"
+#include "client/library/common/lb_context.h"
 
 namespace EnvoyClient {
 
@@ -12,7 +13,7 @@ Endpoint fromInternal(const Envoy::Client::EndpointInfo& info) {
 }
 } // namespace
 
-Client::Client(std::unique_ptr<Envoy::Client::ClientEngine> engine)
+Client::Client(std::unique_ptr<Envoy::Client::ClientEngineInterface> engine)
     : engine_(std::move(engine)) {}
 
 Client::~Client() { shutdown(); }
@@ -29,7 +30,8 @@ std::unique_ptr<Client> Client::create(const std::string& bootstrap_yaml) {
     return nullptr;
   }
 
-  return std::unique_ptr<Client>(new Client(std::move(engine)));
+  return std::unique_ptr<Client>(
+      new Client(std::unique_ptr<Envoy::Client::ClientEngineInterface>(std::move(engine))));
 }
 
 bool Client::waitReady(int timeout_seconds) {
@@ -52,10 +54,10 @@ std::vector<Endpoint> Client::resolve(const std::string& cluster_name) {
 
 absl::optional<Endpoint> Client::pickEndpoint(const std::string& cluster_name,
                                               const RequestContext& ctx) {
-  // TODO(Phase 1): Implement ClientLoadBalancerContext that maps RequestContext fields
-  // (override_host, hash_key, metadata) to Envoy's LoadBalancerContext interface.
-  // For now, we use a null context which uses the default LB behavior.
-  auto result = engine_->configStore().pickEndpoint(cluster_name, nullptr);
+  Envoy::Client::ClientLoadBalancerContext lb_ctx(ctx.hash_key, ctx.override_host,
+                                                  ctx.override_host_strict, ctx.path,
+                                                  ctx.authority);
+  auto result = engine_->configStore().pickEndpoint(cluster_name, &lb_ctx);
   if (!result.has_value()) {
     return absl::nullopt;
   }
@@ -92,6 +94,11 @@ void Client::watchConfig(const std::string& resource_type,
         }
         callback(ce);
       });
+}
+
+void Client::reportResult(const std::string& address, uint32_t port, uint32_t status_code,
+                          uint64_t latency_ms) {
+  engine_->configStore().reportResult(address, port, status_code, latency_ms);
 }
 
 void Client::shutdown() {

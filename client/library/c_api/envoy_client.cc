@@ -1,14 +1,7 @@
-#include "client/library/c_api/envoy_client.h"
+#include "client/library/c_api/envoy_client_internal.h"
 
 #include <cstring>
 #include <string>
-
-#include "client/library/cc/client.h"
-
-// The opaque handle wraps the C++ Client object.
-struct envoy_client_engine {
-  std::unique_ptr<EnvoyClient::Client> client;
-};
 
 extern "C" {
 
@@ -97,6 +90,37 @@ envoy_client_status envoy_client_pick_endpoint(envoy_client_handle handle,
     }
   }
 
+  // Invoke the LB context provider (if registered) so the app can enrich the
+  // context before the pick — e.g. inject a consistent-hash key or an
+  // override host derived from request-level state.
+  if (handle->lb_context_cb != nullptr) {
+    envoy_client_request_context mutable_ctx{};
+    mutable_ctx.path = ctx.path.empty() ? nullptr : ctx.path.c_str();
+    mutable_ctx.authority = ctx.authority.empty() ? nullptr : ctx.authority.c_str();
+    mutable_ctx.override_host = ctx.override_host.empty() ? nullptr : ctx.override_host.c_str();
+    mutable_ctx.override_host_strict = ctx.override_host_strict ? 1u : 0u;
+    mutable_ctx.hash_key = ctx.hash_key.empty() ? nullptr : ctx.hash_key.c_str();
+    mutable_ctx.hash_key_len = ctx.hash_key.size();
+    mutable_ctx.metadata = nullptr;
+
+    handle->lb_context_cb(cluster_name, &mutable_ctx, handle->lb_context_user_ctx);
+
+    // Read back any fields the callback may have added or changed.
+    if (mutable_ctx.path != nullptr) {
+      ctx.path = mutable_ctx.path;
+    }
+    if (mutable_ctx.authority != nullptr) {
+      ctx.authority = mutable_ctx.authority;
+    }
+    if (mutable_ctx.override_host != nullptr) {
+      ctx.override_host = mutable_ctx.override_host;
+    }
+    ctx.override_host_strict = mutable_ctx.override_host_strict != 0;
+    if (mutable_ctx.hash_key != nullptr && mutable_ctx.hash_key_len > 0) {
+      ctx.hash_key = std::string(mutable_ctx.hash_key, mutable_ctx.hash_key_len);
+    }
+  }
+
   auto result = handle->client->pickEndpoint(cluster_name, ctx);
   if (!result.has_value()) {
     return ENVOY_CLIENT_UNAVAILABLE;
@@ -128,11 +152,13 @@ void envoy_client_free_endpoints(envoy_client_endpoint_list* endpoints) {
   endpoints->count = 0;
 }
 
-void envoy_client_report_result(envoy_client_handle /*handle*/,
-                                const envoy_client_endpoint* /*endpoint*/,
-                                uint32_t /*status_code*/, uint64_t /*latency_ms*/) {
-  // TODO(Phase 1): Implement feedback-driven LB reporting.
-  // This will feed into outlier detection / least-request LB state.
+void envoy_client_report_result(envoy_client_handle handle,
+                                const envoy_client_endpoint* endpoint,
+                                uint32_t status_code, uint64_t latency_ms) {
+  if (handle == nullptr || endpoint == nullptr || endpoint->address == nullptr) {
+    return;
+  }
+  handle->client->reportResult(endpoint->address, endpoint->port, status_code, latency_ms);
 }
 
 envoy_client_status envoy_client_set_cluster_lb_policy(envoy_client_handle handle,
@@ -191,10 +217,14 @@ envoy_client_status envoy_client_remove_interceptor(envoy_client_handle /*handle
   return ENVOY_CLIENT_OK;
 }
 
-envoy_client_status envoy_client_set_lb_context_provider(envoy_client_handle /*handle*/,
-                                                         envoy_client_lb_context_cb /*callback*/,
-                                                         void* /*context*/) {
-  // TODO(Phase 1): Wire up LB context provider callback.
+envoy_client_status envoy_client_set_lb_context_provider(envoy_client_handle handle,
+                                                         envoy_client_lb_context_cb callback,
+                                                         void* context) {
+  if (handle == nullptr) {
+    return ENVOY_CLIENT_ERROR;
+  }
+  handle->lb_context_cb = callback;
+  handle->lb_context_user_ctx = context;
   return ENVOY_CLIENT_OK;
 }
 

@@ -1,11 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <string>
 #include <vector>
 
-#include "envoy/config/cluster/v3/cluster.pb.h"
-#include "envoy/config/endpoint/v3/endpoint.pb.h"
 #include "envoy/upstream/cluster_manager.h"
 #include "envoy/upstream/load_balancer.h"
 
@@ -104,16 +103,49 @@ public:
   void notifyConfigChange(const std::string& resource_type, const std::string& resource_name,
                           ConfigEvent event);
 
+  /**
+   * Record the outcome of a request to an endpoint for feedback-driven LB.
+   * @param address the endpoint IP address string.
+   * @param port the endpoint port.
+   * @param status_code HTTP status code (0 = connection-level error).
+   * @param latency_ms observed request latency in milliseconds.
+   */
+  void reportResult(const std::string& address, uint32_t port, uint32_t status_code,
+                    uint64_t latency_ms);
+
 private:
   static EndpointInfo hostToEndpointInfo(const Upstream::Host& host);
 
+  /**
+   * Pick an endpoint using a client-side LB algorithm instead of Envoy's
+   * server-configured policy. Called when a cluster or default LB override is set.
+   */
+  absl::optional<EndpointInfo> pickEndpointWithPolicy(const std::string& cluster_name,
+                                                      const std::string& lb_policy,
+                                                      Upstream::LoadBalancerContext* context);
+
   Upstream::ClusterManager& cluster_manager_;
 
-  // Client-side LB policy overrides
+  // Client-side LB policy overrides and round-robin counters
   absl::Mutex lb_override_mutex_;
   absl::flat_hash_map<std::string, std::string> cluster_lb_overrides_
       ABSL_GUARDED_BY(lb_override_mutex_);
   std::string default_lb_override_ ABSL_GUARDED_BY(lb_override_mutex_);
+  // Per-cluster round-robin counters for the "round_robin" override policy.
+  absl::flat_hash_map<std::string, uint64_t> rr_counters_ ABSL_GUARDED_BY(lb_override_mutex_);
+
+  // Global counter for random-style selection (used by non-RR override policies).
+  std::atomic<uint64_t> random_counter_{0};
+
+  // Per-endpoint call stats for feedback-driven LB (keyed by "address:port").
+  struct EndpointCallStats {
+    uint64_t total_requests{0};
+    uint64_t error_requests{0};
+    uint64_t total_latency_ms{0};
+  };
+  absl::Mutex stats_mutex_;
+  absl::flat_hash_map<std::string, EndpointCallStats> endpoint_call_stats_
+      ABSL_GUARDED_BY(stats_mutex_);
 
   // Config watchers
   absl::Mutex watchers_mutex_;
