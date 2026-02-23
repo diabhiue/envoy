@@ -11,6 +11,9 @@
 #include "source/server/options_impl_base.h"
 
 #include "client/library/common/config_store.h"
+#include "client/library/common/engine_interface.h"
+
+#include "source/common/common/posix/thread_impl.h"
 
 #include "absl/synchronization/notification.h"
 
@@ -37,7 +40,7 @@ namespace Client {
  *     from any thread (they read from thread-local cluster state)
  *   - Interceptors and filter callbacks run on the engine's Dispatcher thread
  */
-class ClientEngine : public Logger::Loggable<Logger::Id::client> {
+class ClientEngine : public ClientEngineInterface, public Logger::Loggable<Logger::Id::client> {
 public:
   /**
    * Construct a client engine.

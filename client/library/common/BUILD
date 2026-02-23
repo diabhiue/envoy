@@ -9,6 +9,16 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "engine_interface_lib",
+    hdrs = ["engine_interface.h"],
+    repository = "@envoy",
+    deps = [
+        ":config_store_lib",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+envoy_cc_library(
     name = "config_store_lib",
     srcs = ["config_store.cc"],
     hdrs = ["config_store.h"],
@@ -30,6 +40,7 @@ envoy_cc_library(
     repository = "@envoy",
     deps = [
         ":config_store_lib",
+        ":engine_interface_lib",
         "//envoy/server:instance_interface",
         "//source/common/common:logger_lib",
         "//source/common/common:thread_lib",
@@ -40,7 +51,7 @@ envoy_cc_library(
         "//source/exe:stripped_main_base_lib",
         "//source/server:listener_hooks_lib",
         "//source/server:null_overload_manager_lib",
-        "//source/server:options_impl_base_lib",
+        "//source/server:options_base",
         "@com_google_absl//absl/synchronization",
     ],
 )

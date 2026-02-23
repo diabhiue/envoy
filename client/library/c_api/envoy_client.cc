@@ -1,14 +1,7 @@
-#include "client/library/c_api/envoy_client.h"
+#include "client/library/c_api/envoy_client_internal.h"
 
 #include <cstring>
 #include <string>
-
-#include "client/library/cc/client.h"
-
-// The opaque handle wraps the C++ Client object.
-struct envoy_client_engine {
-  std::unique_ptr<EnvoyClient::Client> client;
-};
 
 extern "C" {
 

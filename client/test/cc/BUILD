@@ -9,21 +9,13 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_test(
-    name = "engine_test",
-    srcs = ["engine_test.cc"],
+    name = "client_test",
+    srcs = ["client_test.cc"],
     repository = "@envoy",
     deps = [
-        "//client/library/common:engine_lib",
-        "//source/server:options_base",
-    ],
-)
-
-envoy_cc_test(
-    name = "config_store_test",
-    srcs = ["config_store_test.cc"],
-    repository = "@envoy",
-    deps = [
+        "//client/library/cc:client_lib",
         "//client/library/common:config_store_lib",
+        "//client/library/common:engine_interface_lib",
         "//source/common/network:utility_lib",
         "//test/mocks/upstream:cluster_manager_mocks",
         "//test/mocks/upstream:host_mocks",

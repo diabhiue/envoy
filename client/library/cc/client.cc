@@ -12,7 +12,7 @@ Endpoint fromInternal(const Envoy::Client::EndpointInfo& info) {
 }
 } // namespace
 
-Client::Client(std::unique_ptr<Envoy::Client::ClientEngine> engine)
+Client::Client(std::unique_ptr<Envoy::Client::ClientEngineInterface> engine)
     : engine_(std::move(engine)) {}
 
 Client::~Client() { shutdown(); }
@@ -29,7 +29,8 @@ std::unique_ptr<Client> Client::create(const std::string& bootstrap_yaml) {
     return nullptr;
   }
 
-  return std::unique_ptr<Client>(new Client(std::move(engine)));
+  return std::unique_ptr<Client>(
+      new Client(std::unique_ptr<Envoy::Client::ClientEngineInterface>(std::move(engine))));
 }
 
 bool Client::waitReady(int timeout_seconds) {
@@ -51,7 +52,7 @@ std::vector<Endpoint> Client::resolve(const std::string& cluster_name) {
 }
 
 absl::optional<Endpoint> Client::pickEndpoint(const std::string& cluster_name,
-                                              const RequestContext& ctx) {
+                                              const RequestContext& /*ctx*/) {
   // TODO(Phase 1): Implement ClientLoadBalancerContext that maps RequestContext fields
   // (override_host, hash_key, metadata) to Envoy's LoadBalancerContext interface.
   // For now, we use a null context which uses the default LB behavior.

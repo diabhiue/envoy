@@ -1,5 +1,6 @@
 #include "client/library/common/engine.h"
 
+#include "source/common/common/posix/thread_impl.h"
 #include "source/common/common/random_generator.h"
 #include "source/common/runtime/runtime_impl.h"
 #include "source/server/null_overload_manager.h"

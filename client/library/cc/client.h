@@ -6,12 +6,7 @@
 #include <vector>
 
 #include "client/library/common/config_store.h"
-
-namespace Envoy {
-namespace Client {
-class ClientEngine;
-} // namespace Client
-} // namespace Envoy
+#include "client/library/common/engine_interface.h"
 
 namespace EnvoyClient {
 
@@ -134,10 +129,19 @@ public:
    */
   void shutdown();
 
-private:
-  explicit Client(std::unique_ptr<Envoy::Client::ClientEngine> engine);
+  /**
+   * Test-only factory: create a Client around an already-constructed engine.
+   * Not for production use.
+   */
+  static std::unique_ptr<Client>
+  createForTesting(std::unique_ptr<Envoy::Client::ClientEngineInterface> engine) {
+    return std::unique_ptr<Client>(new Client(std::move(engine)));
+  }
 
-  std::unique_ptr<Envoy::Client::ClientEngine> engine_;
+private:
+  explicit Client(std::unique_ptr<Envoy::Client::ClientEngineInterface> engine);
+
+  std::unique_ptr<Envoy::Client::ClientEngineInterface> engine_;
 };
 
 } // namespace EnvoyClient
