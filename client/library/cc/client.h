@@ -125,6 +125,16 @@ public:
                    std::function<void(const ConfigEvent&)> callback);
 
   /**
+   * Record the outcome of a request for feedback-driven LB.
+   * @param address endpoint IP address.
+   * @param port endpoint port.
+   * @param status_code HTTP status code (0 = connection error).
+   * @param latency_ms request latency in milliseconds.
+   */
+  void reportResult(const std::string& address, uint32_t port, uint32_t status_code,
+                    uint64_t latency_ms);
+
+  /**
    * Shut down the client engine.
    */
   void shutdown();

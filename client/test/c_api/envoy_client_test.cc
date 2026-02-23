@@ -391,11 +391,58 @@ TEST(EnvoyClientApiTest, RemoveInterceptorReturnsOk) {
   envoy_client_destroy(owner->handle);
 }
 
-TEST(EnvoyClientApiTest, SetLbContextProviderReturnsOk) {
+TEST(EnvoyClientApiTest, SetLbContextProviderNullHandleReturnsError) {
+  auto cb = [](const char*, envoy_client_request_context*, void*) {};
+  EXPECT_EQ(ENVOY_CLIENT_ERROR, envoy_client_set_lb_context_provider(nullptr, cb, nullptr));
+}
+
+TEST(EnvoyClientApiTest, SetLbContextProviderCallbackInvokedOnPick) {
   auto owner = makeTestHandle();
+
+  struct Capture {
+    bool called{false};
+    std::string seen_cluster;
+  } cap;
+
+  // Captureless lambda converts to a plain function pointer.
+  auto cb = [](const char* cluster_name, envoy_client_request_context* ctx, void* user_ctx) {
+    auto* c = static_cast<Capture*>(user_ctx);
+    c->called = true;
+    c->seen_cluster = cluster_name;
+    // Enrich the context: inject a consistent-hash key.
+    ctx->hash_key = "session-42";
+    ctx->hash_key_len = 10;
+  };
+
+  EXPECT_EQ(ENVOY_CLIENT_OK,
+            envoy_client_set_lb_context_provider(owner->handle, cb, &cap));
+
+  // Trigger a pick — the mock LB returns no host, but the callback must fire.
+  owner->cm.thread_local_cluster_.lb_.host_ = nullptr;
+  envoy_client_endpoint out{};
+  envoy_client_pick_endpoint(owner->handle, "svc", nullptr, &out);
+
+  EXPECT_TRUE(cap.called);
+  EXPECT_EQ("svc", cap.seen_cluster);
+
+  envoy_client_destroy(owner->handle);
+}
+
+TEST(EnvoyClientApiTest, SetLbContextProviderNullCallbackClearsProvider) {
+  auto owner = makeTestHandle();
+
+  // Register a callback then clear it — must not crash on a subsequent pick.
   auto cb = [](const char*, envoy_client_request_context*, void*) {};
   EXPECT_EQ(ENVOY_CLIENT_OK,
             envoy_client_set_lb_context_provider(owner->handle, cb, nullptr));
+  EXPECT_EQ(ENVOY_CLIENT_OK,
+            envoy_client_set_lb_context_provider(owner->handle, nullptr, nullptr));
+
+  owner->cm.thread_local_cluster_.lb_.host_ = nullptr;
+  envoy_client_endpoint out{};
+  // With no callback registered, pick must not crash.
+  envoy_client_pick_endpoint(owner->handle, "svc", nullptr, &out);
+
   envoy_client_destroy(owner->handle);
 }
 

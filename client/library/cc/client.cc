@@ -96,6 +96,11 @@ void Client::watchConfig(const std::string& resource_type,
       });
 }
 
+void Client::reportResult(const std::string& address, uint32_t port, uint32_t status_code,
+                          uint64_t latency_ms) {
+  engine_->configStore().reportResult(address, port, status_code, latency_ms);
+}
+
 void Client::shutdown() {
   if (engine_ && !engine_->isTerminated()) {
     engine_->terminate();

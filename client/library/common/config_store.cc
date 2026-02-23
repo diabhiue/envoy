@@ -2,6 +2,8 @@
 
 #include "envoy/upstream/thread_local_cluster.h"
 
+#include "absl/strings/str_cat.h"
+
 namespace Envoy {
 namespace Client {
 
@@ -31,6 +33,23 @@ bool ConfigStore::resolve(const std::string& cluster_name,
 absl::optional<EndpointInfo>
 ConfigStore::pickEndpoint(const std::string& cluster_name,
                           Upstream::LoadBalancerContext* context) {
+  // Check for a client-side LB policy override (cluster-specific beats default).
+  std::string lb_policy;
+  {
+    absl::ReaderMutexLock lock(&lb_override_mutex_);
+    auto it = cluster_lb_overrides_.find(cluster_name);
+    if (it != cluster_lb_overrides_.end()) {
+      lb_policy = it->second;
+    } else if (!default_lb_override_.empty()) {
+      lb_policy = default_lb_override_;
+    }
+  }
+
+  if (!lb_policy.empty()) {
+    return pickEndpointWithPolicy(cluster_name, lb_policy, context);
+  }
+
+  // Default: delegate to Envoy's server-configured LB.
   auto* tlc = cluster_manager_.getThreadLocalCluster(cluster_name);
   if (tlc == nullptr) {
     ENVOY_LOG(debug, "client: cluster '{}' not found for pick", cluster_name);
@@ -47,20 +66,93 @@ ConfigStore::pickEndpoint(const std::string& cluster_name,
   return hostToEndpointInfo(*host);
 }
 
+absl::optional<EndpointInfo>
+ConfigStore::pickEndpointWithPolicy(const std::string& cluster_name,
+                                    const std::string& lb_policy,
+                                    Upstream::LoadBalancerContext* context) {
+  auto* tlc = cluster_manager_.getThreadLocalCluster(cluster_name);
+  if (tlc == nullptr) {
+    ENVOY_LOG(debug, "client: cluster '{}' not found for policy-based pick", cluster_name);
+    return absl::nullopt;
+  }
+
+  // Collect healthy endpoints from the lowest-numbered priority level that has any.
+  const auto& priority_set = tlc->prioritySet();
+  std::vector<EndpointInfo> candidates;
+  for (size_t p = 0; p < priority_set.hostSetsPerPriority().size(); ++p) {
+    const auto& host_set = priority_set.hostSetsPerPriority()[p];
+    for (const auto& host : host_set->hosts()) {
+      auto ep = hostToEndpointInfo(*host);
+      if (ep.health_status == 1) { // Healthy
+        candidates.push_back(std::move(ep));
+      }
+    }
+    if (!candidates.empty()) {
+      break;
+    }
+  }
+
+  // Fall back to all hosts (any health) if no healthy ones were found.
+  if (candidates.empty()) {
+    for (size_t p = 0; p < priority_set.hostSetsPerPriority().size(); ++p) {
+      const auto& host_set = priority_set.hostSetsPerPriority()[p];
+      for (const auto& host : host_set->hosts()) {
+        candidates.push_back(hostToEndpointInfo(*host));
+      }
+      if (!candidates.empty()) {
+        break;
+      }
+    }
+  }
+
+  if (candidates.empty()) {
+    ENVOY_LOG(debug, "client: no endpoints for '{}' with override policy '{}'", cluster_name,
+              lb_policy);
+    return absl::nullopt;
+  }
+
+  // Hash-based selection (ring_hash, maglev): use the context's hash key.
+  if (context != nullptr && (lb_policy.find("ring_hash") != std::string::npos ||
+                              lb_policy.find("maglev") != std::string::npos)) {
+    auto hash_key_opt = context->computeHashKey();
+    if (hash_key_opt.has_value()) {
+      const size_t idx = static_cast<size_t>(hash_key_opt.value().hash) % candidates.size();
+      ENVOY_LOG(debug, "client: hash-based pick for '{}': index {}/{}", cluster_name, idx,
+                candidates.size());
+      return candidates[idx];
+    }
+  }
+
+  // Round-robin: use a per-cluster monotonically increasing counter.
+  if (lb_policy.find("round_robin") != std::string::npos) {
+    absl::MutexLock lock(&lb_override_mutex_);
+    const size_t idx =
+        static_cast<size_t>(rr_counters_[cluster_name]++) % candidates.size();
+    ENVOY_LOG(debug, "client: round-robin pick for '{}': index {}/{}", cluster_name, idx,
+              candidates.size());
+    return candidates[idx];
+  }
+
+  // Random / least_request / any unrecognized policy: use a global monotonic counter.
+  const size_t idx =
+      static_cast<size_t>(random_counter_.fetch_add(1, std::memory_order_relaxed)) %
+      candidates.size();
+  ENVOY_LOG(debug, "client: random pick for '{}': index {}/{}", cluster_name, idx,
+            candidates.size());
+  return candidates[idx];
+}
+
 void ConfigStore::setClusterLbPolicy(const std::string& cluster_name,
                                      const std::string& lb_policy_name) {
   absl::MutexLock lock(&lb_override_mutex_);
   if (lb_policy_name.empty()) {
     cluster_lb_overrides_.erase(cluster_name);
+    ENVOY_LOG(info, "client: LB policy override cleared for cluster '{}'", cluster_name);
   } else {
     cluster_lb_overrides_[cluster_name] = lb_policy_name;
+    ENVOY_LOG(info, "client: LB policy override for cluster '{}' set to '{}'", cluster_name,
+              lb_policy_name);
   }
-  // TODO(Phase 1): Apply the override to the cluster's LB factory.
-  // This requires intercepting cluster creation or replacing the LB on the ThreadLocalCluster.
-  // For now, we store the intent; actual LB replacement will be implemented
-  // when we have the full ClientEngine lifecycle wired up.
-  ENVOY_LOG(info, "client: LB policy override for cluster '{}' set to '{}'", cluster_name,
-            lb_policy_name);
 }
 
 void ConfigStore::setDefaultLbPolicy(const std::string& lb_policy_name) {
@@ -82,6 +174,24 @@ void ConfigStore::notifyConfigChange(const std::string& resource_type,
       callback(resource_type, resource_name, event);
     }
   }
+}
+
+void ConfigStore::reportResult(const std::string& address, uint32_t port,
+                               uint32_t status_code, uint64_t latency_ms) {
+  const std::string key = absl::StrCat(address, ":", port);
+  absl::MutexLock lock(&stats_mutex_);
+  auto& stats = endpoint_call_stats_[key];
+  ++stats.total_requests;
+  stats.total_latency_ms += latency_ms;
+  // Count connection errors (status 0) and server errors (5xx) as failures.
+  if (status_code == 0 || status_code >= 500) {
+    ++stats.error_requests;
+  }
+  ENVOY_LOG(debug,
+            "client: reportResult {}:{} status={} latency={}ms "
+            "(total={} errors={})",
+            address, port, status_code, latency_ms, stats.total_requests,
+            stats.error_requests);
 }
 
 EndpointInfo ConfigStore::hostToEndpointInfo(const Upstream::Host& host) {

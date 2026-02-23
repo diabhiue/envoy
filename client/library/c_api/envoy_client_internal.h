@@ -10,4 +10,9 @@
 // they agree on the struct layout without exposing it in the public C API.
 struct envoy_client_engine {
   std::unique_ptr<EnvoyClient::Client> client;
+
+  // LB context provider: invoked during every pick_endpoint call so the app
+  // can enrich the LB context (e.g. inject a hash key or override host).
+  envoy_client_lb_context_cb lb_context_cb{nullptr};
+  void* lb_context_user_ctx{nullptr};
 };
