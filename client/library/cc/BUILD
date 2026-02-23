@@ -17,6 +17,7 @@ envoy_cc_library(
         "//client/library/common:config_store_lib",
         "//client/library/common:engine_interface_lib",
         "//client/library/common:engine_lib",
+        "//client/library/common:lb_context_lib",
         "//source/server:options_base",
     ],
 )

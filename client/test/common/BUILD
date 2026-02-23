@@ -32,3 +32,13 @@ envoy_cc_test(
         "//test/mocks/upstream:thread_local_cluster_mocks",
     ],
 )
+
+envoy_cc_test(
+    name = "lb_context_test",
+    srcs = ["lb_context_test.cc"],
+    repository = "@envoy",
+    deps = [
+        "//client/library/common:lb_context_lib",
+        "//source/common/http:header_map_lib",
+    ],
+)

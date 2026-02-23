@@ -34,6 +34,19 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "lb_context_lib",
+    srcs = ["lb_context.cc"],
+    hdrs = ["lb_context.h"],
+    repository = "@envoy",
+    deps = [
+        "//envoy/upstream:load_balancer_interface",
+        "//source/common/common:hash_lib",
+        "//source/common/http:header_map_lib",
+        "//source/common/upstream:load_balancer_context_base_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "engine_lib",
     srcs = ["engine.cc"],
     hdrs = ["engine.h"],

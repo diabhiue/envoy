@@ -3,6 +3,7 @@
 #include "source/server/options_impl_base.h"
 
 #include "client/library/common/engine.h"
+#include "client/library/common/lb_context.h"
 
 namespace EnvoyClient {
 
@@ -52,11 +53,11 @@ std::vector<Endpoint> Client::resolve(const std::string& cluster_name) {
 }
 
 absl::optional<Endpoint> Client::pickEndpoint(const std::string& cluster_name,
-                                              const RequestContext& /*ctx*/) {
-  // TODO(Phase 1): Implement ClientLoadBalancerContext that maps RequestContext fields
-  // (override_host, hash_key, metadata) to Envoy's LoadBalancerContext interface.
-  // For now, we use a null context which uses the default LB behavior.
-  auto result = engine_->configStore().pickEndpoint(cluster_name, nullptr);
+                                              const RequestContext& ctx) {
+  Envoy::Client::ClientLoadBalancerContext lb_ctx(ctx.hash_key, ctx.override_host,
+                                                  ctx.override_host_strict, ctx.path,
+                                                  ctx.authority);
+  auto result = engine_->configStore().pickEndpoint(cluster_name, &lb_ctx);
   if (!result.has_value()) {
     return absl::nullopt;
   }
