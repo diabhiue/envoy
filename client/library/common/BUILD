@@ -14,8 +14,6 @@ envoy_cc_library(
     hdrs = ["config_store.h"],
     repository = "@envoy",
     deps = [
-        "//envoy/config/cluster/v3:cluster_cc_proto",
-        "//envoy/config/endpoint/v3:endpoint_cc_proto",
         "//envoy/upstream:cluster_manager_interface",
         "//envoy/upstream:load_balancer_interface",
         "//envoy/upstream:thread_local_cluster_interface",

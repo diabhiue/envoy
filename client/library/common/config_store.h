@@ -4,8 +4,6 @@
 #include <string>
 #include <vector>
 
-#include "envoy/config/cluster/v3/cluster.pb.h"
-#include "envoy/config/endpoint/v3/endpoint.pb.h"
 #include "envoy/upstream/cluster_manager.h"
 #include "envoy/upstream/load_balancer.h"
 
