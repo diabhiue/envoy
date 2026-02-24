@@ -13,6 +13,9 @@ none of which are satisfactory:
 | **gRPC xDS** (`grpc-go/xds`, `grpc-java/xds`, etc.) | Endpoint resolution, some LB policies | No filter chain, no server-enforced policy, partial xDS, reimplemented per language |
 | **Envoy Mobile** | Full Envoy in-process | Tied to Android/iOS, owns the entire data path (replaces your HTTP client), large binary |
 
+The Envoy Client Library fills this gap by providing full xDS + filter chain + upstream connection
+management for any client platform, without the Mobile constraints.
+
 ### The Gap
 
 gRPC clients today each have **their own bespoke xDS client** implementation that:
@@ -40,9 +43,7 @@ Build an **Envoy Client Library** — a language-agnostic, embeddable library th
 
 ### Non-Goals (initially)
 
-- Replacing the application's HTTP/gRPC transport (the library does NOT own the data path)
 - Body-level filter processing (compression, transcoding) — headers-only initially
-- Full connection pooling to upstream targets
 - Downstream listener/accept functionality
 
 ## Architecture
@@ -114,46 +115,45 @@ Build an **Envoy Client Library** — a language-agnostic, embeddable library th
 └───────────────────────────────────────────────────────────┘
 ```
 
-### Key Design Decision: Library Does NOT Own the Data Path
+### Key Design Decision: Library Owns the Data Path
 
-This is the critical difference from Envoy Mobile. The client library:
+The client library manages upstream connections directly, including to the application's upstream
+targets. This includes:
 
-- Does **NOT** make HTTP connections to the application's upstream targets
-- Does **NOT** manage connection pools to those targets
-- Does **NOT** parse HTTP frames on the application's request/response path
+- **Making HTTP/gRPC connections** to upstream services discovered via xDS (CDS/EDS)
+- **Managing connection pools** to those upstream targets
+- **Owning connections** to external filter services (ext_authz, JWKS, OAuth token endpoints)
 
-It answers two questions:
+It answers three questions:
 1. **"Where should I send this?"** → endpoint resolution + LB pick
 2. **"What should the request/response look like?"** → filter chain execution (header mutation,
    auth injection, authz checks)
+3. **"Send it"** → the library makes the upstream connection and forwards the request
 
-The application's existing gRPC/HTTP client makes the actual connections and sends the data.
+The library's `ClusterManager` manages all upstream clusters — both the application's service
+targets and external filter service dependencies (ext_authz, JWKS, OAuth).
 
-However, the library **does** own connections to **external filter services** — when a filter
-like `ext_authz` needs to call an authorization service, or `jwt_authn` needs to fetch JWKS,
-or `oauth2` needs to exchange tokens, the library's internal `ClusterManager` manages those
-connections.
+### Why ClusterManager Is Central
 
-### Why ClusterManager Cannot Be Fully Replaced
-
-From exploring the codebase, filters that make outbound calls depend on `ClusterManager`:
+`ClusterManager` is the backbone of all upstream connectivity in the client library:
 
 - `ext_authz` → `GrpcClientImpl` uses `Grpc::AsyncClient` from `ClusterManager::grpcAsyncClientManager()`
 - `ext_authz` (HTTP mode) → `RawHttpClientImpl` uses `Http::AsyncClient` from `ClusterManager`
 - `jwt_authn` → `JwksAsyncFetcher` uses `Http::AsyncClient` for JWKS endpoint fetching
 - `oauth2` → `OAuth2Client` uses `Http::AsyncClient` for token exchange
 - `ext_proc` → Uses streaming `Grpc::AsyncClient` for bi-directional processing
+- **Application upstreams** → `ClusterManager` pools connections to services discovered via CDS/EDS
 
-These async clients require:
-- Connection pool management to the external services
+All upstream connections require:
+- Connection pool management
 - The Envoy `Dispatcher` (event loop) for non-blocking I/O
-- Cluster configuration for the external services (timeouts, TLS, retry)
+- Cluster configuration (timeouts, TLS, retry, circuit breakers)
 
-Therefore, the client library uses `ClusterManager` in a **reduced capacity**:
+Therefore, the client library uses `ClusterManager` in **full capacity**:
+- It manages clusters/connections for the application's upstream targets (CDS/EDS-discovered)
 - It manages clusters/connections for external filter services (authz, OAuth, JWKS)
-- It does NOT create clusters for the application's actual upstream targets
-- The application's upstream endpoints are tracked in a lightweight `ConfigStore` (read-only
-  view of xDS state for endpoint resolution and LB)
+- The `ConfigStore` provides a lightweight read-only view of xDS state for endpoint resolution
+  and LB decisions, complementing the full `ClusterManager`
 
 ## Reuse of Existing Envoy Components
 
@@ -185,14 +185,21 @@ Therefore, the client library uses `ClusterManager` in a **reduced capacity**:
 | JNI bridge | `mobile/library/jni/` | Reuse JNI patterns for Java bindings |
 | Extension registry | `@envoy_build_config//:extension_registry` | Separate registry with client-relevant extensions |
 
+### Reused (additional — upstream data path)
+
+| Component | Location | Used For |
+|-----------|----------|----------|
+| `ClusterManager` | `source/common/upstream/` | Full connection pool management for all upstreams |
+| HTTP connection pools | `source/common/http/conn_pool_base.h` | Pooling upstream HTTP/gRPC connections |
+| HTTP codecs (H1/H2/H3) | `source/common/http/` | Encoding requests to upstream targets |
+| `Router::Filter` | `source/common/router/` | Request forwarding to upstream clusters |
+
 ### NOT Reused
 
 | Component | Reason |
 |-----------|--------|
 | `ListenerManager` | No downstream listeners in a client library |
 | `HttpConnectionManager` | No downstream HTTP connections to manage |
-| HTTP codecs (H1/H2/H3) | Application's HTTP client handles encoding |
-| Connection pools | Application manages its own connections |
 | `AdminServer` | Not needed for embedded client |
 | `GuardDog` | Lightweight; no watchdog needed |
 | `HdsDelegate` | No health discovery service delegation |
@@ -1360,18 +1367,18 @@ static_resources:
 
 | Aspect | `mobile/` | `client/` |
 |--------|-----------|-----------|
-| **Owns data path** | Yes (full HTTP codec, conn pools) | No (app's client sends data) |
-| **Event loop** | Yes (for full proxy) | Yes (for xDS + filter callouts only) |
-| **Async outbound calls** | Yes (full upstream) | Yes (filter callouts: ext_authz, JWKS, etc.) |
+| **Owns data path** | Yes (full HTTP codec, conn pools) | Yes (owns upstream connections + conn pools) |
+| **Event loop** | Yes (for full proxy) | Yes (for xDS + upstream I/O + filter callouts) |
+| **Async outbound calls** | Yes (full upstream) | Yes (upstream targets + filter callouts: ext_authz, JWKS, etc.) |
 | **Platform bindings** | Android (JNI), iOS (Swift/ObjC) | Go (CGo), Java (JNI), Python, Rust, C++ |
 | **Bootstrap** | `StrippedMainBase` + `ServerLite` | `StrippedMainBase` + `ServerClientLite` |
 | **Filters** | Full chain (request + response body) | Header-focused + async callouts |
 | **Client filters** | `addPlatformFilter` / `addNativeFilter` | `addNativeFilter` + interceptors + filter merge policy |
 | **LB override** | N/A (library picks endpoint & connects) | Per-request, per-cluster, and default LB policy overrides |
-| **Target binary size** | ~15-20MB | ~8-12MB (no codec, no conn pool for app upstreams) |
+| **Target binary size** | ~15-20MB | ~12-16MB (upstream conn pools + codecs included) |
 | **ListenerManager** | API listener (no TCP accept) | Not needed |
-| **ClusterManager** | Full (owns all connections) | Reduced (filter callout connections only) |
-| **Use case** | Mobile app HTTP networking | Any client needing xDS + server-enforced policy |
+| **ClusterManager** | Full (owns all connections) | Full (owns all upstream + filter callout connections) |
+| **Use case** | Mobile app HTTP networking | Any client needing xDS + server-enforced policy + managed upstream connections |
 
 ## Open Design Questions
 
