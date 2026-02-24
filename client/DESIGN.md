@@ -40,6 +40,8 @@ Build an **Envoy Client Library** — a language-agnostic, embeddable library th
    filters that make outbound calls (ext_authz, jwt_authn, oauth2)
 4. **Auth header injection** — centrally managed credentials appended to requests
 5. **Health checking** — client-side endpoint health driven by xDS config
+6. **Upstream connection ownership** — the library owns TCP/H2 connection pools to upstream
+   targets and handles the full request/response data path for xDS-managed clusters
 
 ### Non-Goals (initially)
 
@@ -1459,7 +1461,7 @@ to block (e.g., making their own network calls)?
 
 ## Implementation Phases
 
-### Phase 1: xDS Core + Endpoint Resolution + LB Overrides
+### Phase 1: xDS Core + Endpoint Resolution + LB Overrides ✅
 - `ServerClientLite` bootstrap via `StrippedMainBase`
 - xDS subscriptions: CDS + EDS
 - `ConfigStore` with endpoint resolution
@@ -1469,9 +1471,9 @@ to block (e.g., making their own network calls)?
 - **Config watch** callbacks for CDS/EDS changes
 - C ABI: `create`, `destroy`, `resolve`, `pick_endpoint`, `report_result`,
   `set_cluster_lb_policy`, `set_default_lb_policy`, `set_lb_context_provider`, `watch_config`
-- C++ API + one language binding (Go or Java)
+- C++ API + Go and Java language bindings
 
-### Phase 2: Filter Chain + Auth + Interceptors
+### Phase 2: Filter Chain + Auth + Interceptors ✅
 - LDS + RDS subscriptions
 - `HeadlessFilterChain` execution
 - Synchronous filters: `header_mutation`, `credential_injector`, `rbac`
@@ -1480,18 +1482,28 @@ to block (e.g., making their own network calls)?
 - **Filter merge policy**: `CLIENT_WRAPS_SERVER` (default), `CLIENT_BEFORE_SERVER`, etc.
 - C ABI: `apply_request_filters`, `apply_response_filters`, `add_interceptor`, `remove_interceptor`
 
-### Phase 3: Async Filter Callouts
-- `ext_authz` support (gRPC + HTTP modes)
+### Phase 3: Upstream Connection Ownership
+- Upgrade `ServerClientLite` to own TCP/H2 connection pools to upstream targets
+- Full `ClusterManager` integration for CDS/EDS-managed application clusters (not just
+  filter-callout clusters)
+- HTTP/1.1 and HTTP/2 codec integration for upstream request encoding/decoding
+- Request forwarding through `Router::Filter` (or a lightweight equivalent)
+- End-to-end request path: pick endpoint → apply filter chain → send request → stream response
+- C ABI: `envoy_client_send_request`, streaming response callbacks
+- Retire the "pass-through" model; the library is the transport for all xDS-managed clusters
+
+### Phase 4: Async Filter Callouts
+- `ext_authz` support (gRPC + HTTP modes) — uses the same `ClusterManager` path from Phase 3
 - `jwt_authn` with JWKS fetching
 - `oauth2` token management
 - Full async callback model in C ABI
 
-### Phase 4: gRPC Integration + Multi-Language
+### Phase 5: gRPC Integration + Multi-Language
 - gRPC resolver/balancer/interceptor integration (Go, Java, C++)
 - Drop-in replacement for `grpc-xds` in each language
 - Python and Rust bindings
 
-### Phase 5: Advanced Features
+### Phase 6: Advanced Features
 - SDS (mTLS certificate management)
 - ECDS (dynamic filter config)
 - WASM filter support
