@@ -47,6 +47,17 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "filter_chain_manager_lib",
+    srcs = ["filter_chain_manager.cc"],
+    hdrs = ["filter_chain_manager.h"],
+    repository = "@envoy",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//client/library/c_api:envoy_client_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "engine_lib",
     srcs = ["engine.cc"],
     hdrs = ["engine.h"],

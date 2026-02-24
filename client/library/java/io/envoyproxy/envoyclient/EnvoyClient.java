@@ -4,7 +4,9 @@ import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -228,6 +230,93 @@ public final class EnvoyClient implements Closeable {
   }
 
   // ---------------------------------------------------------------------------
+  // Filter chain (Phase 2)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Applies client interceptors and the server-pushed filter chain to request
+   * headers. The execution order (CLIENT_WRAPS_SERVER) is:
+   * <ol>
+   *   <li>Interceptors in PRE_REQUEST phase</li>
+   *   <li>Server filter chain (pass-through in Phase 2)</li>
+   *   <li>Interceptors in POST_REQUEST phase</li>
+   * </ol>
+   *
+   * @param clusterName the cluster this request targets.
+   * @param headers     the request headers to process.
+   * @return the (possibly modified) headers after all filters have run.
+   * @throws EnvoyClientException if a filter or interceptor denies the request.
+   */
+  public Map<String, String> applyRequestFilters(String clusterName, Map<String, String> headers) {
+    if (clusterName == null) throw new IllegalArgumentException("clusterName must not be null");
+    String[] result = nativeApplyRequestFilters(nativeHandle, clusterName, mapToArray(headers));
+    if (result == null) throw new EnvoyClientException("Request denied by filter chain");
+    return arrayToMap(result);
+  }
+
+  /**
+   * Applies client interceptors and the server-pushed filter chain to response
+   * headers. Same semantics as {@link #applyRequestFilters}.
+   */
+  public Map<String, String> applyResponseFilters(String clusterName, Map<String, String> headers) {
+    if (clusterName == null) throw new IllegalArgumentException("clusterName must not be null");
+    String[] result = nativeApplyResponseFilters(nativeHandle, clusterName, mapToArray(headers));
+    if (result == null) throw new EnvoyClientException("Response denied by filter chain");
+    return arrayToMap(result);
+  }
+
+  /**
+   * Registers a named interceptor. Interceptors execute in registration order.
+   *
+   * @param name        unique name; throws if already registered.
+   * @param interceptor the callback; must be non-blocking and thread-safe.
+   * @throws EnvoyClientException if {@code name} is already registered.
+   */
+  public void addInterceptor(String name, Interceptor interceptor) {
+    if (name == null) throw new IllegalArgumentException("name must not be null");
+    if (interceptor == null) throw new IllegalArgumentException("interceptor must not be null");
+    int status = nativeAddInterceptor(nativeHandle, name, interceptor);
+    if (status != 0) throw new EnvoyClientException("addInterceptor failed: status " + status);
+  }
+
+  /**
+   * Removes a previously registered interceptor by name.
+   *
+   * @throws EnvoyClientException if no interceptor with that name exists.
+   */
+  public void removeInterceptor(String name) {
+    if (name == null) throw new IllegalArgumentException("name must not be null");
+    int status = nativeRemoveInterceptor(nativeHandle, name);
+    if (status != 0) throw new EnvoyClientException("removeInterceptor failed: status " + status);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: header map ↔ flat String[] conversion for JNI
+  // ---------------------------------------------------------------------------
+
+  /** Converts a Map<String,String> to a flat [k0, v0, k1, v1, ...] String array. */
+  private static String[] mapToArray(Map<String, String> m) {
+    if (m == null || m.isEmpty()) return new String[0];
+    String[] arr = new String[m.size() * 2];
+    int i = 0;
+    for (Map.Entry<String, String> e : m.entrySet()) {
+      arr[i++] = e.getKey();
+      arr[i++] = e.getValue() != null ? e.getValue() : "";
+    }
+    return arr;
+  }
+
+  /** Converts a flat [k0, v0, k1, v1, ...] String array back to a LinkedHashMap. */
+  private static Map<String, String> arrayToMap(String[] arr) {
+    if (arr == null || arr.length == 0) return Collections.emptyMap();
+    Map<String, String> result = new LinkedHashMap<>(arr.length / 2);
+    for (int i = 0; i + 1 < arr.length; i += 2) {
+      result.put(arr[i], arr[i + 1]);
+    }
+    return Collections.unmodifiableMap(result);
+  }
+
+  // ---------------------------------------------------------------------------
   // JNI declarations
   // ---------------------------------------------------------------------------
 
@@ -276,4 +365,29 @@ public final class EnvoyClient implements Closeable {
    * C callback. Returns a C status code.
    */
   private static native int nativeSetLbContextProvider(long handle, LbContextProvider provider);
+
+  /**
+   * Applies request filters. Passes headers as flat [k,v,...] array; returns
+   * modified headers in the same format. Returns null on DENIED.
+   */
+  private static native String[] nativeApplyRequestFilters(long handle, String clusterName,
+      String[] headers);
+
+  /**
+   * Applies response filters. Same format as nativeApplyRequestFilters.
+   */
+  private static native String[] nativeApplyResponseFilters(long handle, String clusterName,
+      String[] headers);
+
+  /**
+   * Registers a named interceptor. The JNI layer stores a global ref and
+   * invokes {@link Interceptor#onHeaders} from the C callback. Returns a C
+   * status code.
+   */
+  private static native int nativeAddInterceptor(long handle, String name, Interceptor interceptor);
+
+  /**
+   * Removes a named interceptor. Returns a C status code.
+   */
+  private static native int nativeRemoveInterceptor(long handle, String name);
 }

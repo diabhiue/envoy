@@ -353,6 +353,213 @@ func TestStatusError_Formatting(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2: Filter chain / interceptors
+// ---------------------------------------------------------------------------
+
+func TestApplyRequestFilters_NoInterceptors_PassThrough(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	in := []envoyclient.Header{
+		{Key: "x-request-id", Value: "abc-123"},
+		{Key: "content-type", Value: "application/json"},
+	}
+	out, err := c.ApplyRequestFilters("test-cluster", in)
+	if err != nil {
+		t.Fatalf("ApplyRequestFilters() error: %v", err)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("expected %d headers back, got %d", len(in), len(out))
+	}
+}
+
+func TestApplyResponseFilters_NoInterceptors_PassThrough(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	in := []envoyclient.Header{
+		{Key: "content-length", Value: "42"},
+	}
+	out, err := c.ApplyResponseFilters("test-cluster", in)
+	if err != nil {
+		t.Fatalf("ApplyResponseFilters() error: %v", err)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("expected %d headers back, got %d", len(in), len(out))
+	}
+}
+
+func TestApplyRequestFilters_EmptyHeaders_OK(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	out, err := c.ApplyRequestFilters("test-cluster", nil)
+	if err != nil {
+		t.Fatalf("ApplyRequestFilters(nil) error: %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("expected 0 headers, got %d", len(out))
+	}
+}
+
+func TestAddInterceptor_HeaderMutation(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	err := c.AddInterceptor("add-auth", func(headers []envoyclient.Header, cluster string, phase envoyclient.InterceptorPhase) ([]envoyclient.Header, error) {
+		if phase == envoyclient.PhasePreRequest {
+			headers = append(headers, envoyclient.Header{Key: "x-auth-token", Value: "secret"})
+		}
+		return headers, nil
+	})
+	if err != nil {
+		t.Fatalf("AddInterceptor() error: %v", err)
+	}
+
+	out, err := c.ApplyRequestFilters("test-cluster", []envoyclient.Header{
+		{Key: "content-type", Value: "application/json"},
+	})
+	if err != nil {
+		t.Fatalf("ApplyRequestFilters() error: %v", err)
+	}
+	found := false
+	for _, h := range out {
+		if h.Key == "x-auth-token" && h.Value == "secret" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected x-auth-token header to be injected by interceptor, got %v", out)
+	}
+}
+
+func TestAddInterceptor_Deny_ReturnsError(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	err := c.AddInterceptor("deny-all", func(headers []envoyclient.Header, cluster string, phase envoyclient.InterceptorPhase) ([]envoyclient.Header, error) {
+		return nil, envoyclient.StatusDenied
+	})
+	if err != nil {
+		t.Fatalf("AddInterceptor() error: %v", err)
+	}
+
+	_, err = c.ApplyRequestFilters("test-cluster", []envoyclient.Header{
+		{Key: "x-request-id", Value: "123"},
+	})
+	if err == nil {
+		t.Fatal("expected error from denied interceptor, got nil")
+	}
+}
+
+func TestAddInterceptor_DuplicateName_ReturnsError(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	noopFn := func(headers []envoyclient.Header, cluster string, phase envoyclient.InterceptorPhase) ([]envoyclient.Header, error) {
+		return headers, nil
+	}
+
+	if err := c.AddInterceptor("my-interceptor", noopFn); err != nil {
+		t.Fatalf("first AddInterceptor() error: %v", err)
+	}
+	if err := c.AddInterceptor("my-interceptor", noopFn); err == nil {
+		t.Fatal("expected error for duplicate interceptor name, got nil")
+	}
+}
+
+func TestRemoveInterceptor_RemovesEffect(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	called := false
+	err := c.AddInterceptor("add-header", func(headers []envoyclient.Header, cluster string, phase envoyclient.InterceptorPhase) ([]envoyclient.Header, error) {
+		called = true
+		headers = append(headers, envoyclient.Header{Key: "x-injected", Value: "yes"})
+		return headers, nil
+	})
+	if err != nil {
+		t.Fatalf("AddInterceptor() error: %v", err)
+	}
+
+	if err := c.RemoveInterceptor("add-header"); err != nil {
+		t.Fatalf("RemoveInterceptor() error: %v", err)
+	}
+
+	out, err := c.ApplyRequestFilters("test-cluster", nil)
+	if err != nil {
+		t.Fatalf("ApplyRequestFilters() error: %v", err)
+	}
+	if called {
+		t.Error("removed interceptor was still called")
+	}
+	for _, h := range out {
+		if h.Key == "x-injected" {
+			t.Error("removed interceptor still injected header x-injected")
+		}
+	}
+}
+
+func TestRemoveInterceptor_Unknown_ReturnsError(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	if err := c.RemoveInterceptor("no-such-interceptor"); err == nil {
+		t.Fatal("expected error for unknown interceptor, got nil")
+	}
+}
+
+func TestInterceptor_PhaseOrdering_PreBeforePost(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	var phases []envoyclient.InterceptorPhase
+	err := c.AddInterceptor("phase-recorder", func(headers []envoyclient.Header, cluster string, phase envoyclient.InterceptorPhase) ([]envoyclient.Header, error) {
+		phases = append(phases, phase)
+		return headers, nil
+	})
+	if err != nil {
+		t.Fatalf("AddInterceptor() error: %v", err)
+	}
+
+	if _, err := c.ApplyRequestFilters("test-cluster", nil); err != nil {
+		t.Fatalf("ApplyRequestFilters() error: %v", err)
+	}
+
+	if len(phases) < 2 {
+		t.Fatalf("expected at least 2 phase callbacks, got %d", len(phases))
+	}
+	if phases[0] != envoyclient.PhasePreRequest {
+		t.Errorf("first phase should be PhasePreRequest (%d), got %d", envoyclient.PhasePreRequest, phases[0])
+	}
+	if phases[1] != envoyclient.PhasePostRequest {
+		t.Errorf("second phase should be PhasePostRequest (%d), got %d", envoyclient.PhasePostRequest, phases[1])
+	}
+}
+
+func TestInterceptor_ClusterNamePassedCorrectly(t *testing.T) {
+	c := mustNew(t)
+	defer c.Close()
+
+	var seenCluster string
+	err := c.AddInterceptor("cluster-check", func(headers []envoyclient.Header, cluster string, phase envoyclient.InterceptorPhase) ([]envoyclient.Header, error) {
+		seenCluster = cluster
+		return headers, nil
+	})
+	if err != nil {
+		t.Fatalf("AddInterceptor() error: %v", err)
+	}
+
+	if _, err := c.ApplyRequestFilters("test-cluster", nil); err != nil {
+		t.Fatalf("ApplyRequestFilters() error: %v", err)
+	}
+
+	if seenCluster != "test-cluster" {
+		t.Errorf("interceptor received cluster %q, want %q", seenCluster, "test-cluster")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
