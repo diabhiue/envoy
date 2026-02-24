@@ -8,7 +8,10 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -376,5 +379,132 @@ public class EnvoyClientTest {
     assertTrue(s.contains("cluster"));
     assertTrue(s.contains("my-cluster"));
     assertTrue(s.contains("UPDATED"));
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2: Filter chain / interceptors
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void applyRequestFilters_noInterceptors_passThroughHeaders() {
+    Map<String, String> headers = new LinkedHashMap<>();
+    headers.put("x-request-id", "abc-123");
+    headers.put("content-type", "application/json");
+    Map<String, String> out = client.applyRequestFilters("test-cluster", headers);
+    assertNotNull(out);
+    assertEquals(headers.size(), out.size());
+    assertEquals("abc-123", out.get("x-request-id"));
+    assertEquals("application/json", out.get("content-type"));
+  }
+
+  @Test
+  public void applyResponseFilters_noInterceptors_passThroughHeaders() {
+    Map<String, String> headers = new LinkedHashMap<>();
+    headers.put("content-length", "42");
+    Map<String, String> out = client.applyResponseFilters("test-cluster", headers);
+    assertNotNull(out);
+    assertEquals(1, out.size());
+    assertEquals("42", out.get("content-length"));
+  }
+
+  @Test
+  public void applyRequestFilters_emptyHeaders_returnsEmpty() {
+    Map<String, String> out = client.applyRequestFilters("test-cluster", Collections.emptyMap());
+    assertNotNull(out);
+    assertTrue(out.isEmpty());
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void applyRequestFilters_nullClusterName_throwsIllegalArgument() {
+    client.applyRequestFilters(null, Collections.emptyMap());
+  }
+
+  @Test
+  public void addInterceptor_injectsHeader() {
+    client.addInterceptor("add-auth", (headers, cluster, phase) -> {
+      if (phase == InterceptorPhase.PRE_REQUEST) {
+        headers.put("x-auth-token", "secret");
+      }
+      return true;
+    });
+
+    Map<String, String> input = new LinkedHashMap<>();
+    input.put("content-type", "application/json");
+    Map<String, String> out = client.applyRequestFilters("test-cluster", input);
+    assertEquals("secret", out.get("x-auth-token"));
+  }
+
+  @Test(expected = EnvoyClientException.class)
+  public void addInterceptor_deny_throwsEnvoyClientException() {
+    client.addInterceptor("deny-all", (headers, cluster, phase) -> false);
+    Map<String, String> headers = new LinkedHashMap<>();
+    headers.put("x-request-id", "123");
+    client.applyRequestFilters("test-cluster", headers); // should throw
+  }
+
+  @Test(expected = EnvoyClientException.class)
+  public void addInterceptor_duplicateName_throwsEnvoyClientException() {
+    Interceptor noop = (headers, cluster, phase) -> true;
+    client.addInterceptor("my-interceptor", noop);
+    client.addInterceptor("my-interceptor", noop); // duplicate -> throws
+  }
+
+  @Test
+  public void removeInterceptor_removesEffect() {
+    AtomicBoolean called = new AtomicBoolean(false);
+    client.addInterceptor("removable", (headers, cluster, phase) -> {
+      called.set(true);
+      headers.put("x-injected", "yes");
+      return true;
+    });
+    client.removeInterceptor("removable");
+
+    Map<String, String> out = client.applyRequestFilters("test-cluster", Collections.emptyMap());
+    assertFalse("removed interceptor should not be called", called.get());
+    assertNull("removed interceptor should not inject headers", out.get("x-injected"));
+  }
+
+  @Test(expected = EnvoyClientException.class)
+  public void removeInterceptor_unknownName_throwsEnvoyClientException() {
+    client.removeInterceptor("no-such-interceptor");
+  }
+
+  @Test
+  public void interceptor_receivesCorrectClusterName() {
+    AtomicReference<String> seenCluster = new AtomicReference<>();
+    client.addInterceptor("cluster-check", (headers, cluster, phase) -> {
+      seenCluster.set(cluster);
+      return true;
+    });
+    client.applyRequestFilters("test-cluster", Collections.emptyMap());
+    assertEquals("test-cluster", seenCluster.get());
+  }
+
+  @Test
+  public void interceptor_phaseOrdering_preBeforePost() {
+    List<InterceptorPhase> phases = new ArrayList<>();
+    client.addInterceptor("phase-recorder", (headers, cluster, phase) -> {
+      phases.add(phase);
+      return true;
+    });
+    client.applyRequestFilters("test-cluster", Collections.emptyMap());
+    assertTrue("expected at least 2 phase callbacks", phases.size() >= 2);
+    assertEquals(InterceptorPhase.PRE_REQUEST, phases.get(0));
+    assertEquals(InterceptorPhase.POST_REQUEST, phases.get(1));
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void addInterceptor_nullName_throwsIllegalArgument() {
+    client.addInterceptor(null, (headers, cluster, phase) -> true);
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void addInterceptor_nullInterceptor_throwsIllegalArgument() {
+    client.addInterceptor("my-interceptor", null);
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void removeInterceptor_nullName_throwsIllegalArgument() {
+    client.removeInterceptor(null);
   }
 }

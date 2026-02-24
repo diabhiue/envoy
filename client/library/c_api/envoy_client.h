@@ -127,6 +127,33 @@ envoy_client_status envoy_client_watch_config(envoy_client_handle handle,
                                               const char* resource_type,
                                               envoy_client_config_cb callback, void* context);
 
+// --- Filter Chain (Phase 2) ---
+
+// Callback fired when filter application completes (sync or async).
+// Caller takes ownership of modified_headers and must call envoy_client_free_headers.
+typedef void (*envoy_client_filter_cb)(envoy_client_status status,
+                                       envoy_client_headers* modified_headers, void* context);
+
+// Apply request filters (interceptors + server filter chain) for a cluster.
+// Callback fires when all filters have run. Returns a request_id for cancellation.
+// Phase 2: fires synchronously before this function returns; request_id is always 0.
+uint64_t envoy_client_apply_request_filters(envoy_client_handle handle,
+                                             const char* cluster_name,
+                                             envoy_client_headers* headers,
+                                             envoy_client_filter_cb callback, void* context);
+
+// Apply response filters for a cluster. Same semantics as apply_request_filters.
+uint64_t envoy_client_apply_response_filters(envoy_client_handle handle,
+                                              const char* cluster_name,
+                                              envoy_client_headers* headers,
+                                              envoy_client_filter_cb callback, void* context);
+
+// Cancel an in-flight filter operation (no-op for Phase 2 synchronous operations).
+void envoy_client_cancel_filter(envoy_client_handle handle, uint64_t request_id);
+
+// Free headers returned by filter callbacks. Also frees the struct pointer itself.
+void envoy_client_free_headers(envoy_client_headers* headers);
+
 // --- Client Interceptors ---
 
 typedef enum {
@@ -142,12 +169,12 @@ typedef envoy_client_status (*envoy_client_interceptor_cb)(envoy_client_headers*
                                                            envoy_client_interceptor_phase phase,
                                                            void* context);
 
-// Register a named interceptor.
+// Register a named interceptor. Interceptors execute in registration order.
 envoy_client_status envoy_client_add_interceptor(envoy_client_handle handle, const char* name,
                                                  envoy_client_interceptor_cb callback,
                                                  void* context);
 
-// Remove a previously registered interceptor.
+// Remove a previously registered interceptor by name.
 envoy_client_status envoy_client_remove_interceptor(envoy_client_handle handle, const char* name);
 
 // --- LB Context Provider ---
