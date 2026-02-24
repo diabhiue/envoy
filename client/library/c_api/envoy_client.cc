@@ -50,12 +50,12 @@ envoy_client_status envoy_client_resolve(envoy_client_handle handle, const char*
   }
 
   out_endpoints->count = endpoints.size();
-  out_endpoints->endpoints = new envoy_client_endpoint[endpoints.size()];
+  // Use malloc/calloc so cross-language callers (Go, Java/JNI) can free with free().
+  out_endpoints->endpoints =
+      static_cast<envoy_client_endpoint*>(calloc(endpoints.size(), sizeof(envoy_client_endpoint)));
   for (size_t i = 0; i < endpoints.size(); ++i) {
-    // Allocate and copy the address string so the caller owns the memory.
-    char* addr = new char[endpoints[i].address.size() + 1];
-    std::memcpy(addr, endpoints[i].address.c_str(), endpoints[i].address.size() + 1);
-    out_endpoints->endpoints[i].address = addr;
+    // strdup allocates with malloc so callers can free() the address string.
+    out_endpoints->endpoints[i].address = strdup(endpoints[i].address.c_str());
     out_endpoints->endpoints[i].port = endpoints[i].port;
     out_endpoints->endpoints[i].weight = endpoints[i].weight;
     out_endpoints->endpoints[i].priority = endpoints[i].priority;
@@ -126,10 +126,8 @@ envoy_client_status envoy_client_pick_endpoint(envoy_client_handle handle,
     return ENVOY_CLIENT_UNAVAILABLE;
   }
 
-  // Copy address to caller-owned memory. The caller must free this.
-  char* addr = new char[result->address.size() + 1];
-  std::memcpy(addr, result->address.c_str(), result->address.size() + 1);
-  out_endpoint->address = addr;
+  // strdup allocates with malloc so cross-language callers can free() it.
+  out_endpoint->address = strdup(result->address.c_str());
   out_endpoint->port = result->port;
   out_endpoint->weight = result->weight;
   out_endpoint->priority = result->priority;
@@ -144,9 +142,9 @@ void envoy_client_free_endpoints(envoy_client_endpoint_list* endpoints) {
   }
   if (endpoints->endpoints != nullptr) {
     for (size_t i = 0; i < endpoints->count; ++i) {
-      delete[] endpoints->endpoints[i].address;
+      free(const_cast<char*>(endpoints->endpoints[i].address));
     }
-    delete[] endpoints->endpoints;
+    free(endpoints->endpoints);
     endpoints->endpoints = nullptr;
   }
   endpoints->count = 0;
