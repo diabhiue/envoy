@@ -257,6 +257,95 @@ envoy_client_status envoy_client_remove_interceptor(envoy_client_handle handle,
   return handle->filter_chain_manager->removeInterceptor(name);
 }
 
+uint64_t envoy_client_send_request(envoy_client_handle handle, const char* cluster_name,
+                                   const envoy_client_headers* request_headers,
+                                   const void* request_body, size_t request_body_len,
+                                   envoy_client_response_cb response_cb, void* context) {
+  if (handle == nullptr || cluster_name == nullptr || response_cb == nullptr) {
+    if (response_cb != nullptr) {
+      response_cb(ENVOY_CLIENT_ERROR, nullptr, context);
+    }
+    return 0;
+  }
+
+  // Convert C headers to std pairs.
+  std::vector<std::pair<std::string, std::string>> headers;
+  if (request_headers != nullptr) {
+    headers.reserve(request_headers->count);
+    for (size_t i = 0; i < request_headers->count; ++i) {
+      const auto& h = request_headers->headers[i];
+      headers.emplace_back(std::string(h.key, h.key_len), std::string(h.value, h.value_len));
+    }
+  }
+
+  // Copy body into a std::string.
+  std::string body;
+  if (request_body != nullptr && request_body_len > 0) {
+    body.assign(static_cast<const char*>(request_body), request_body_len);
+  }
+
+  return handle->client->sendRequest(
+      cluster_name, headers, body,
+      [response_cb, context](Envoy::Client::UpstreamResponse resp) {
+        if (!resp.success) {
+          response_cb(ENVOY_CLIENT_ERROR, nullptr, context);
+          return;
+        }
+
+        // Build envoy_client_response.
+        auto* c_resp = new envoy_client_response();
+        c_resp->status_code = resp.status_code;
+
+        // Convert headers.
+        c_resp->headers = new envoy_client_headers();
+        c_resp->headers->count = resp.headers.size();
+        c_resp->headers->headers = static_cast<envoy_client_header*>(
+            calloc(resp.headers.size(), sizeof(envoy_client_header)));
+        for (size_t i = 0; i < resp.headers.size(); ++i) {
+          const auto& [k, v] = resp.headers[i];
+          c_resp->headers->headers[i].key = strdup(k.c_str());
+          c_resp->headers->headers[i].key_len = k.size();
+          c_resp->headers->headers[i].value = strdup(v.c_str());
+          c_resp->headers->headers[i].value_len = v.size();
+        }
+
+        // Copy body.
+        char* body_buf = nullptr;
+        if (!resp.body.empty()) {
+          body_buf = static_cast<char*>(malloc(resp.body.size()));
+          memcpy(body_buf, resp.body.data(), resp.body.size());
+        }
+        c_resp->body = body_buf;
+        c_resp->body_len = resp.body.size();
+
+        response_cb(ENVOY_CLIENT_OK, c_resp, context);
+
+        // The caller is responsible for freeing c_resp via envoy_client_free_response.
+      });
+}
+
+void envoy_client_cancel_request(envoy_client_handle handle, uint64_t request_id) {
+  if (handle != nullptr && request_id != 0) {
+    handle->client->cancelRequest(request_id);
+  }
+}
+
+void envoy_client_free_response(envoy_client_response* response) {
+  if (response == nullptr) {
+    return;
+  }
+  if (response->headers != nullptr) {
+    for (size_t i = 0; i < response->headers->count; ++i) {
+      free(const_cast<char*>(response->headers->headers[i].key));
+      free(const_cast<char*>(response->headers->headers[i].value));
+    }
+    free(response->headers->headers);
+    delete response->headers;
+  }
+  free(const_cast<char*>(response->body));
+  delete response;
+}
+
 envoy_client_status envoy_client_set_lb_context_provider(envoy_client_handle handle,
                                                          envoy_client_lb_context_cb callback,
                                                          void* context) {

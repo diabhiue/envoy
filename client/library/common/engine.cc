@@ -2,6 +2,7 @@
 
 #include "source/common/common/posix/thread_impl.h"
 #include "source/common/common/random_generator.h"
+#include "source/common/http/header_map_impl.h"
 #include "source/common/runtime/runtime_impl.h"
 #include "source/server/null_overload_manager.h"
 
@@ -120,6 +121,10 @@ void ClientEngine::main() {
   // Create the ConfigStore backed by ClusterManager.
   config_store_ = std::make_unique<ConfigStore>(server_->clusterManager());
 
+  // Create the UpstreamRequestManager for Phase 3 upstream connection ownership.
+  upstream_request_manager_ = std::make_unique<UpstreamRequestManager>(
+      server_->clusterManager(), server_->dispatcher());
+
   // Register a post-init callback to notify waiters that the engine is ready.
   // PostInit fires after initial xDS config has been received and clusters are warming.
   auto postinit_handle = server_->lifecycleNotifier().registerCallback(
@@ -128,10 +133,32 @@ void ClientEngine::main() {
   // Run the event loop (blocks until shutdown).
   base_->runServer();
 
-  // Event loop exited — clean up.
+  // Event loop exited — clean up in reverse construction order.
+  upstream_request_manager_.reset();
   config_store_.reset();
   base_.reset();
   server_ = nullptr;
+}
+
+uint64_t ClientEngine::sendRequest(
+    const std::string& cluster_name,
+    const std::vector<std::pair<std::string, std::string>>& headers_vec,
+    const std::string& body, UpstreamResponseCallback callback) {
+  ASSERT(upstream_request_manager_ != nullptr);
+
+  // Convert the plain-string header pairs to an Envoy RequestHeaderMap.
+  auto headers = Http::RequestHeaderMapImpl::create();
+  for (const auto& [key, value] : headers_vec) {
+    headers->addCopy(Http::LowerCaseString(key), value);
+  }
+
+  return upstream_request_manager_->sendRequest(cluster_name, std::move(headers), body,
+                                                std::move(callback));
+}
+
+void ClientEngine::cancelRequest(uint64_t request_id) {
+  ASSERT(upstream_request_manager_ != nullptr);
+  upstream_request_manager_->cancelRequest(request_id);
 }
 
 } // namespace Client

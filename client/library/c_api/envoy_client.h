@@ -177,6 +177,38 @@ envoy_client_status envoy_client_add_interceptor(envoy_client_handle handle, con
 // Remove a previously registered interceptor by name.
 envoy_client_status envoy_client_remove_interceptor(envoy_client_handle handle, const char* name);
 
+// --- Upstream Request Sending (Phase 3) ---
+
+// Response returned by envoy_client_send_request.
+// Caller takes ownership; free with envoy_client_free_response.
+typedef struct {
+  uint32_t status_code;         // HTTP status code (e.g. 200, 503)
+  envoy_client_headers* headers; // Response headers; caller must free
+  const char* body;              // Response body (malloc'd); caller must free
+  size_t body_len;
+} envoy_client_response;
+
+// Callback invoked when an upstream request completes (success or failure).
+// On success: status = ENVOY_CLIENT_OK, response is non-NULL.
+// On failure: status != ENVOY_CLIENT_OK, response is NULL.
+// The callback fires on the engine's background thread.
+typedef void (*envoy_client_response_cb)(envoy_client_status status,
+                                         const envoy_client_response* response, void* context);
+
+// Send an HTTP request to an xDS-managed cluster.
+// The library owns the upstream connection; no separate transport is required.
+// Returns a request_id for cancellation. Returns 0 on immediate failure.
+uint64_t envoy_client_send_request(envoy_client_handle handle, const char* cluster_name,
+                                   const envoy_client_headers* request_headers,
+                                   const void* request_body, size_t request_body_len,
+                                   envoy_client_response_cb response_cb, void* context);
+
+// Cancel an in-flight request. No-op if the request has already completed.
+void envoy_client_cancel_request(envoy_client_handle handle, uint64_t request_id);
+
+// Free a response returned via envoy_client_response_cb.
+void envoy_client_free_response(envoy_client_response* response);
+
 // --- LB Context Provider ---
 
 // Callback invoked during pick_endpoint to let the app enrich the LB context.

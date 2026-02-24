@@ -35,6 +35,12 @@ public:
   Envoy::Client::ConfigStore& configStore() override { return config_store_; }
   Envoy::Client::ConfigStore& store() { return config_store_; }
 
+  MOCK_METHOD(uint64_t, sendRequest,
+              (const std::string&,
+               const std::vector<std::pair<std::string, std::string>>&,
+               const std::string&, Envoy::Client::UpstreamResponseCallback));
+  MOCK_METHOD(void, cancelRequest, (uint64_t));
+
 private:
   Envoy::Client::ConfigStore config_store_;
 };
@@ -444,6 +450,164 @@ TEST(EnvoyClientApiTest, SetLbContextProviderNullCallbackClearsProvider) {
   envoy_client_pick_endpoint(owner->handle, "svc", nullptr, &out);
 
   envoy_client_destroy(owner->handle);
+}
+
+// ---------------------------------------------------------------------------
+// envoy_client_send_request — guard tests
+// ---------------------------------------------------------------------------
+
+TEST(EnvoyClientApiTest, SendRequestNullHandleFiresErrorCallback) {
+  struct Ctx {
+    envoy_client_status status{ENVOY_CLIENT_OK};
+    bool resp_null{false};
+  } ctx;
+  auto cb = [](envoy_client_status s, const envoy_client_response* r, void* c) {
+    auto* p = static_cast<Ctx*>(c);
+    p->status = s;
+    p->resp_null = (r == nullptr);
+  };
+  uint64_t id = envoy_client_send_request(nullptr, "svc", nullptr, nullptr, 0, cb, &ctx);
+  EXPECT_EQ(0u, id);
+  EXPECT_EQ(ENVOY_CLIENT_ERROR, ctx.status);
+  EXPECT_TRUE(ctx.resp_null);
+}
+
+TEST(EnvoyClientApiTest, SendRequestNullClusterFiresErrorCallback) {
+  auto owner = makeTestHandle();
+  struct Ctx {
+    envoy_client_status status{ENVOY_CLIENT_OK};
+  } ctx;
+  auto cb = [](envoy_client_status s, const envoy_client_response*, void* c) {
+    static_cast<Ctx*>(c)->status = s;
+  };
+  uint64_t id = envoy_client_send_request(owner->handle, nullptr, nullptr, nullptr, 0, cb, &ctx);
+  EXPECT_EQ(0u, id);
+  EXPECT_EQ(ENVOY_CLIENT_ERROR, ctx.status);
+  envoy_client_destroy(owner->handle);
+}
+
+TEST(EnvoyClientApiTest, SendRequestNullCallbackReturnsZero) {
+  auto owner = makeTestHandle();
+  uint64_t id = envoy_client_send_request(owner->handle, "svc", nullptr, nullptr, 0, nullptr, nullptr);
+  EXPECT_EQ(0u, id);
+  envoy_client_destroy(owner->handle);
+}
+
+TEST(EnvoyClientApiTest, SendRequestDelegatesToEngine) {
+  auto owner = makeTestHandle();
+
+  EXPECT_CALL(*owner->engine, sendRequest("svc", _, _, _))
+      .WillOnce([](const std::string&, const auto&, const auto&,
+                   Envoy::Client::UpstreamResponseCallback cb) -> uint64_t {
+        // Immediately invoke the callback with a successful response.
+        Envoy::Client::UpstreamResponse resp;
+        resp.success = true;
+        resp.status_code = 200;
+        resp.headers = {{":status", "200"}, {"content-type", "text/plain"}};
+        resp.body = "hello";
+        cb(std::move(resp));
+        return 42u;
+      });
+
+  struct Ctx {
+    bool called{false};
+    envoy_client_status status{ENVOY_CLIENT_ERROR};
+    uint32_t status_code{0};
+    std::string body;
+  } ctx;
+
+  auto cb = [](envoy_client_status s, const envoy_client_response* r, void* c) {
+    auto* p = static_cast<Ctx*>(c);
+    p->called = true;
+    p->status = s;
+    if (r != nullptr) {
+      p->status_code = r->status_code;
+      if (r->body != nullptr) {
+        p->body.assign(r->body, r->body_len);
+      }
+      envoy_client_free_response(const_cast<envoy_client_response*>(r));
+    }
+  };
+
+  // Include some request headers to exercise the header conversion path.
+  envoy_client_header raw_headers[] = {
+      {":method", 7, "GET", 3},
+      {":path", 5, "/api", 4},
+  };
+  envoy_client_headers req_headers{raw_headers, 2};
+
+  const char body[] = "ping";
+  uint64_t id = envoy_client_send_request(owner->handle, "svc", &req_headers,
+                                          body, sizeof(body) - 1, cb, &ctx);
+
+  EXPECT_EQ(42u, id);
+  EXPECT_TRUE(ctx.called);
+  EXPECT_EQ(ENVOY_CLIENT_OK, ctx.status);
+  EXPECT_EQ(200u, ctx.status_code);
+  EXPECT_EQ("hello", ctx.body);
+
+  envoy_client_destroy(owner->handle);
+}
+
+TEST(EnvoyClientApiTest, SendRequestEngineFailureFiresErrorCallback) {
+  auto owner = makeTestHandle();
+
+  EXPECT_CALL(*owner->engine, sendRequest("svc", _, _, _))
+      .WillOnce([](const std::string&, const auto&, const auto&,
+                   Envoy::Client::UpstreamResponseCallback cb) -> uint64_t {
+        Envoy::Client::UpstreamResponse resp;
+        resp.success = false;
+        resp.status_code = 503;
+        cb(std::move(resp));
+        return 7u;
+      });
+
+  struct Ctx {
+    envoy_client_status status{ENVOY_CLIENT_OK};
+    bool resp_null{false};
+  } ctx;
+
+  auto cb = [](envoy_client_status s, const envoy_client_response* r, void* c) {
+    auto* p = static_cast<Ctx*>(c);
+    p->status = s;
+    p->resp_null = (r == nullptr);
+  };
+
+  envoy_client_send_request(owner->handle, "svc", nullptr, nullptr, 0, cb, &ctx);
+
+  EXPECT_EQ(ENVOY_CLIENT_ERROR, ctx.status);
+  EXPECT_TRUE(ctx.resp_null);
+
+  envoy_client_destroy(owner->handle);
+}
+
+// ---------------------------------------------------------------------------
+// envoy_client_cancel_request
+// ---------------------------------------------------------------------------
+
+TEST(EnvoyClientApiTest, CancelRequestNullHandleIsNoop) {
+  envoy_client_cancel_request(nullptr, 42); // Must not crash.
+}
+
+TEST(EnvoyClientApiTest, CancelRequestZeroIdIsNoop) {
+  auto owner = makeTestHandle();
+  envoy_client_cancel_request(owner->handle, 0); // Must not crash.
+  envoy_client_destroy(owner->handle);
+}
+
+TEST(EnvoyClientApiTest, CancelRequestDelegatesToEngine) {
+  auto owner = makeTestHandle();
+  EXPECT_CALL(*owner->engine, cancelRequest(99u));
+  envoy_client_cancel_request(owner->handle, 99);
+  envoy_client_destroy(owner->handle);
+}
+
+// ---------------------------------------------------------------------------
+// envoy_client_free_response
+// ---------------------------------------------------------------------------
+
+TEST(EnvoyClientApiTest, FreeResponseNullIsNoop) {
+  envoy_client_free_response(nullptr); // Must not crash.
 }
 
 } // namespace

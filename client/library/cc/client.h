@@ -135,6 +135,31 @@ public:
                     uint64_t latency_ms);
 
   /**
+   * Send an HTTP request to an xDS-managed cluster asynchronously.
+   *
+   * The library owns the upstream connection — no separate transport is needed.
+   * The response callback fires on the engine's background thread.
+   *
+   * @param cluster_name the xDS cluster to route the request to.
+   * @param headers request headers as (name, value) pairs. Include :method, :path,
+   *                :scheme, and :authority for HTTP/2 compliance.
+   * @param body optional request body.
+   * @param callback invoked with the response (or error). The UpstreamResponse::success
+   *                 field indicates whether the request succeeded.
+   * @return a request_id that can be passed to cancelRequest(). Returns 0 on failure.
+   */
+  uint64_t sendRequest(const std::string& cluster_name,
+                       const std::vector<std::pair<std::string, std::string>>& headers,
+                       const std::string& body,
+                       Envoy::Client::UpstreamResponseCallback callback);
+
+  /**
+   * Cancel an in-flight request. No-op if already completed.
+   * @param request_id the id returned by sendRequest().
+   */
+  void cancelRequest(uint64_t request_id);
+
+  /**
    * Shut down the client engine.
    */
   void shutdown();

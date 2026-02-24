@@ -12,6 +12,7 @@
 
 #include "client/library/common/config_store.h"
 #include "client/library/common/engine_interface.h"
+#include "client/library/common/upstream_request.h"
 
 #include "source/common/common/posix/thread_impl.h"
 
@@ -99,6 +100,12 @@ public:
     return server_->dispatcher();
   }
 
+  // ClientEngineInterface: upstream request sending
+  uint64_t sendRequest(const std::string& cluster_name,
+                       const std::vector<std::pair<std::string, std::string>>& headers,
+                       const std::string& body, UpstreamResponseCallback callback) override;
+  void cancelRequest(uint64_t request_id) override;
+
 private:
   void main();
 
@@ -110,6 +117,7 @@ private:
   std::unique_ptr<StrippedMainBase> base_;
   Server::Instance* server_{nullptr};
   std::unique_ptr<ConfigStore> config_store_;
+  std::unique_ptr<UpstreamRequestManager> upstream_request_manager_;
 
   // Background thread
   Thread::PosixThreadPtr main_thread_{nullptr};

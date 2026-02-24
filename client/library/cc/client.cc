@@ -101,6 +101,15 @@ void Client::reportResult(const std::string& address, uint32_t port, uint32_t st
   engine_->configStore().reportResult(address, port, status_code, latency_ms);
 }
 
+uint64_t
+Client::sendRequest(const std::string& cluster_name,
+                    const std::vector<std::pair<std::string, std::string>>& headers,
+                    const std::string& body, Envoy::Client::UpstreamResponseCallback callback) {
+  return engine_->sendRequest(cluster_name, headers, body, std::move(callback));
+}
+
+void Client::cancelRequest(uint64_t request_id) { engine_->cancelRequest(request_id); }
+
 void Client::shutdown() {
   if (engine_ && !engine_->isTerminated()) {
     engine_->terminate();

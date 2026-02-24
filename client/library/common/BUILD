@@ -58,6 +58,26 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "upstream_request_lib",
+    srcs = ["upstream_request.cc"],
+    hdrs = ["upstream_request.h"],
+    repository = "@envoy",
+    deps = [
+        ":engine_interface_lib",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/http:async_client_interface",
+        "//envoy/http:header_map_interface",
+        "//envoy/upstream:cluster_manager_interface",
+        "//envoy/upstream:thread_local_cluster_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:logger_lib",
+        "//source/common/http:message_lib",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "engine_lib",
     srcs = ["engine.cc"],
     hdrs = ["engine.h"],
@@ -65,11 +85,13 @@ envoy_cc_library(
     deps = [
         ":config_store_lib",
         ":engine_interface_lib",
+        ":upstream_request_lib",
         "//envoy/server:instance_interface",
         "//source/common/common:logger_lib",
         "//source/common/common:thread_lib",
         "//source/common/common:random_generator_lib",
         "//source/common/event:real_time_system_lib",
+        "//source/common/http:header_map_lib",
         "//source/common/runtime:runtime_lib",
         "//source/exe:platform_impl_lib",
         "//source/exe:stripped_main_base_lib",
