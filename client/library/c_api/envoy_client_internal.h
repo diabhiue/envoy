@@ -4,6 +4,7 @@
 
 #include "client/library/cc/client.h"
 #include "client/library/c_api/envoy_client.h"
+#include "client/library/common/filter_chain_manager.h"
 
 // Internal definition of the opaque handle exposed as envoy_client_handle.
 // Production code (envoy_client.cc) and tests both include this header so
@@ -15,4 +16,9 @@ struct envoy_client_engine {
   // can enrich the LB context (e.g. inject a hash key or override host).
   envoy_client_lb_context_cb lb_context_cb{nullptr};
   void* lb_context_user_ctx{nullptr};
+
+  // Filter chain manager: handles client interceptors and (Phase 3+) the
+  // server-pushed filter chain for apply_request/response_filters.
+  std::unique_ptr<EnvoyClient::FilterChainManager> filter_chain_manager{
+      std::make_unique<EnvoyClient::FilterChainManager>()};
 };

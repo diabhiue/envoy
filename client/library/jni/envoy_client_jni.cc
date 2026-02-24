@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "client/library/c_api/envoy_client.h"
 
@@ -246,6 +247,224 @@ void lbContextCallback(const char* cluster_name, envoy_client_request_context* c
   maybeDetach(attached);
 }
 
+// ---------------------------------------------------------------------------
+// Filter-chain callback context
+// ---------------------------------------------------------------------------
+
+struct FilterCallbackCtx {
+  // Channel between the C callback and the Java thread waiting for results.
+  // We use a global ref to a java.util.concurrent.SynchronousQueue.
+  // But since Phase 2 is synchronous (callback fires before the C function
+  // returns), we just store the result directly in a pair of fields and use
+  // a simple mutex+condvar. The JNI thread blocks on condvar until result_ready
+  // is set by the callback on the same (or dispatcher) thread.
+  //
+  // Because Phase 2 is truly synchronous (callback fires on the calling thread
+  // before envoy_client_apply_request_filters returns), the simplest approach
+  // is to store the result in a struct that the caller can read after the call.
+  bool result_ready = false;
+  envoy_client_status status = ENVOY_CLIENT_ERROR;
+  jobjectArray result_headers = nullptr; // Local ref; caller must delete
+};
+
+// Converts a flat Java String[] [k0,v0,k1,v1,...] to envoy_client_headers.
+// Caller must call FilterChainManager::freeHeaders or envoy_client_free_headers.
+static envoy_client_headers* jstringArrayToHeaders(JNIEnv* env, jobjectArray arr) {
+  if (arr == nullptr) {
+    auto* h = static_cast<envoy_client_headers*>(malloc(sizeof(envoy_client_headers)));
+    h->headers = nullptr;
+    h->count = 0;
+    return h;
+  }
+  jsize total = env->GetArrayLength(arr);
+  jsize n = total / 2;
+  auto* h = static_cast<envoy_client_headers*>(malloc(sizeof(envoy_client_headers)));
+  h->count = static_cast<size_t>(n);
+  if (n == 0) {
+    h->headers = nullptr;
+    return h;
+  }
+  h->headers =
+      static_cast<envoy_client_header*>(calloc(static_cast<size_t>(n), sizeof(envoy_client_header)));
+  for (jsize i = 0; i < n; ++i) {
+    auto key_js = (jstring)env->GetObjectArrayElement(arr, i * 2);
+    auto val_js = (jstring)env->GetObjectArrayElement(arr, i * 2 + 1);
+    std::string key = jstringToString(env, key_js);
+    std::string val = jstringToString(env, val_js);
+    env->DeleteLocalRef(key_js);
+    env->DeleteLocalRef(val_js);
+    h->headers[i].key = strdup(key.c_str());
+    h->headers[i].key_len = key.size();
+    h->headers[i].value = strdup(val.c_str());
+    h->headers[i].value_len = val.size();
+  }
+  return h;
+}
+
+// Converts envoy_client_headers to a flat Java String[] [k0,v0,k1,v1,...].
+static jobjectArray headersToJstringArray(JNIEnv* env, const envoy_client_headers* h) {
+  jclass strCls = env->FindClass("java/lang/String");
+  if (h == nullptr || h->count == 0 || h->headers == nullptr) {
+    jobjectArray empty = env->NewObjectArray(0, strCls, nullptr);
+    env->DeleteLocalRef(strCls);
+    return empty;
+  }
+  jsize total = static_cast<jsize>(h->count) * 2;
+  jobjectArray arr = env->NewObjectArray(total, strCls, nullptr);
+  env->DeleteLocalRef(strCls);
+  for (size_t i = 0; i < h->count; ++i) {
+    jstring key = newJString(env, h->headers[i].key);
+    jstring val = newJString(env, h->headers[i].value);
+    env->SetObjectArrayElement(arr, static_cast<jsize>(i * 2), key);
+    env->SetObjectArrayElement(arr, static_cast<jsize>(i * 2 + 1), val);
+    env->DeleteLocalRef(key);
+    env->DeleteLocalRef(val);
+  }
+  return arr;
+}
+
+// C filter callback used from nativeApplyRequestFilters / nativeApplyResponseFilters.
+// Since Phase 2 is synchronous, this fires on the calling thread before
+// envoy_client_apply_request_filters returns.
+static void filterCallback(envoy_client_status status, envoy_client_headers* modified_headers,
+                            void* context) {
+  auto* ctx = static_cast<FilterCallbackCtx*>(context);
+  ctx->status = status;
+
+  // Convert C headers → Java. We must do this here because we own modified_headers.
+  bool attached = false;
+  JNIEnv* env = getEnv(&attached);
+  if (env != nullptr && modified_headers != nullptr) {
+    ctx->result_headers = headersToJstringArray(env, modified_headers);
+  }
+  envoy_client_free_headers(modified_headers);
+  maybeDetach(attached);
+
+  ctx->result_ready = true;
+}
+
+// ---------------------------------------------------------------------------
+// Interceptor callback context
+// ---------------------------------------------------------------------------
+
+struct InterceptorCtx {
+  jobject interceptorGlobalRef; // io.envoyproxy.envoyclient.Interceptor
+};
+
+static envoy_client_status interceptorCCallback(envoy_client_headers* headers,
+                                                  const char* cluster_name,
+                                                  envoy_client_interceptor_phase phase,
+                                                  void* context) {
+  auto* ctx = static_cast<InterceptorCtx*>(context);
+  bool attached = false;
+  JNIEnv* env = getEnv(&attached);
+  if (env == nullptr) return ENVOY_CLIENT_ERROR;
+
+  // Build Java String[] from C headers.
+  jobjectArray jHeaders = headersToJstringArray(env, headers);
+
+  // Build InterceptorPhase enum.
+  jclass phaseCls = env->FindClass("io/envoyproxy/envoyclient/InterceptorPhase");
+  jmethodID fromInt =
+      env->GetStaticMethodID(phaseCls, "fromInt", "(I)Lio/envoyproxy/envoyclient/InterceptorPhase;");
+  jobject phaseObj = env->CallStaticObjectMethod(phaseCls, fromInt, (jint)phase);
+
+  // Call Interceptor.onHeaders(Map<String,String>, String, InterceptorPhase).
+  // We pass the flat String[] and cluster as an "encoded map"; the Interceptor
+  // interface works with Map<String,String>, so we bridge via a helper that
+  // converts the array to a LinkedHashMap, calls onHeaders, then reads back.
+  //
+  // Since Interceptor.onHeaders takes Map<String,String>, we build a
+  // LinkedHashMap first.
+  jclass mapCls = env->FindClass("java/util/LinkedHashMap");
+  jmethodID mapCtor = env->GetMethodID(mapCls, "<init>", "()V");
+  jobject mapObj = env->NewObject(mapCls, mapCtor);
+  jmethodID putMethod =
+      env->GetMethodID(mapCls, "put",
+                       "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+
+  jsize total = env->GetArrayLength(jHeaders);
+  for (jsize i = 0; i + 1 < total; i += 2) {
+    jobject k = env->GetObjectArrayElement(jHeaders, i);
+    jobject v = env->GetObjectArrayElement(jHeaders, i + 1);
+    env->CallObjectMethod(mapObj, putMethod, k, v);
+    env->DeleteLocalRef(k);
+    env->DeleteLocalRef(v);
+  }
+
+  jstring jCluster = newJString(env, cluster_name);
+  jclass interceptorCls = env->GetObjectClass(ctx->interceptorGlobalRef);
+  jmethodID onHeaders = env->GetMethodID(
+      interceptorCls, "onHeaders",
+      "(Ljava/util/Map;Ljava/lang/String;Lio/envoyproxy/envoyclient/InterceptorPhase;)Z");
+  jboolean cont =
+      env->CallBooleanMethod(ctx->interceptorGlobalRef, onHeaders, mapObj, jCluster, phaseObj);
+
+  if (cont && headers != nullptr) {
+    // Read back modified entries from the map and write into C headers.
+    // We iterate over the map's entrySet to pick up any mutations.
+    jclass setClass = env->FindClass("java/util/Set");
+    jmethodID entrySet = env->GetMethodID(mapCls, "entrySet", "()Ljava/util/Set;");
+    jobject entries = env->CallObjectMethod(mapObj, entrySet);
+    jmethodID iterator = env->GetMethodID(setClass, "iterator", "()Ljava/util/Iterator;");
+    jclass iterClass = env->FindClass("java/util/Iterator");
+    jobject iter = env->CallObjectMethod(entries, iterator);
+    jmethodID hasNext = env->GetMethodID(iterClass, "hasNext", "()Z");
+    jmethodID next = env->GetMethodID(iterClass, "next", "()Ljava/lang/Object;");
+    jclass entryClass = env->FindClass("java/util/Map$Entry");
+    jmethodID getKey =
+        env->GetMethodID(entryClass, "getKey", "()Ljava/lang/Object;");
+    jmethodID getValue =
+        env->GetMethodID(entryClass, "getValue", "()Ljava/lang/Object;");
+
+    // Collect new entries
+    std::vector<std::string> keys, values;
+    while (env->CallBooleanMethod(iter, hasNext)) {
+      jobject entry = env->CallObjectMethod(iter, next);
+      auto k = (jstring)env->CallObjectMethod(entry, getKey);
+      auto v = (jstring)env->CallObjectMethod(entry, getValue);
+      keys.push_back(jstringToString(env, k));
+      values.push_back(jstringToString(env, v));
+      env->DeleteLocalRef(k);
+      env->DeleteLocalRef(v);
+      env->DeleteLocalRef(entry);
+    }
+
+    // Rebuild C headers in-place.
+    for (size_t i = 0; i < headers->count; ++i) {
+      free(const_cast<char*>(headers->headers[i].key));
+      free(const_cast<char*>(headers->headers[i].value));
+    }
+    free(headers->headers);
+    headers->count = keys.size();
+    headers->headers = static_cast<envoy_client_header*>(
+        calloc(keys.size(), sizeof(envoy_client_header)));
+    for (size_t i = 0; i < keys.size(); ++i) {
+      headers->headers[i].key = strdup(keys[i].c_str());
+      headers->headers[i].key_len = keys[i].size();
+      headers->headers[i].value = strdup(values[i].c_str());
+      headers->headers[i].value_len = values[i].size();
+    }
+
+    env->DeleteLocalRef(iter);
+    env->DeleteLocalRef(entries);
+    env->DeleteLocalRef(setClass);
+    env->DeleteLocalRef(iterClass);
+    env->DeleteLocalRef(entryClass);
+  }
+
+  env->DeleteLocalRef(mapObj);
+  env->DeleteLocalRef(mapCls);
+  env->DeleteLocalRef(jHeaders);
+  env->DeleteLocalRef(jCluster);
+  env->DeleteLocalRef(phaseObj);
+  env->DeleteLocalRef(phaseCls);
+  env->DeleteLocalRef(interceptorCls);
+
+  maybeDetach(attached);
+  return cont ? ENVOY_CLIENT_OK : ENVOY_CLIENT_DENIED;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -415,6 +634,77 @@ Java_io_envoyproxy_envoyclient_EnvoyClient_nativeSetLbContextProvider(JNIEnv* en
   return static_cast<jint>(
       envoy_client_set_lb_context_provider(reinterpret_cast<envoy_client_handle>(handle),
                                            lbContextCallback, ctx));
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_io_envoyproxy_envoyclient_EnvoyClient_nativeApplyRequestFilters(
+    JNIEnv* env, jclass /*cls*/, jlong handle, jstring clusterName, jobjectArray headers) {
+  std::string cluster = jstringToString(env, clusterName);
+  envoy_client_headers* cHeaders = jstringArrayToHeaders(env, headers);
+
+  FilterCallbackCtx ctx;
+  ctx.result_ready = false;
+  ctx.result_headers = nullptr;
+
+  auto h = reinterpret_cast<envoy_client_handle>(handle);
+  envoy_client_apply_request_filters(h, cluster.c_str(), cHeaders, filterCallback, &ctx);
+
+  // Free the input headers copy (library made its own copy).
+  for (size_t i = 0; i < cHeaders->count; ++i) {
+    free(const_cast<char*>(cHeaders->headers[i].key));
+    free(const_cast<char*>(cHeaders->headers[i].value));
+  }
+  if (cHeaders->headers) free(cHeaders->headers);
+  free(cHeaders);
+
+  if (!ctx.result_ready || ctx.status == ENVOY_CLIENT_DENIED) return nullptr;
+  return ctx.result_headers;
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_io_envoyproxy_envoyclient_EnvoyClient_nativeApplyResponseFilters(
+    JNIEnv* env, jclass /*cls*/, jlong handle, jstring clusterName, jobjectArray headers) {
+  std::string cluster = jstringToString(env, clusterName);
+  envoy_client_headers* cHeaders = jstringArrayToHeaders(env, headers);
+
+  FilterCallbackCtx ctx;
+  ctx.result_ready = false;
+  ctx.result_headers = nullptr;
+
+  auto h = reinterpret_cast<envoy_client_handle>(handle);
+  envoy_client_apply_response_filters(h, cluster.c_str(), cHeaders, filterCallback, &ctx);
+
+  for (size_t i = 0; i < cHeaders->count; ++i) {
+    free(const_cast<char*>(cHeaders->headers[i].key));
+    free(const_cast<char*>(cHeaders->headers[i].value));
+  }
+  if (cHeaders->headers) free(cHeaders->headers);
+  free(cHeaders);
+
+  if (!ctx.result_ready || ctx.status == ENVOY_CLIENT_DENIED) return nullptr;
+  return ctx.result_headers;
+}
+
+JNIEXPORT jint JNICALL
+Java_io_envoyproxy_envoyclient_EnvoyClient_nativeAddInterceptor(JNIEnv* env, jclass /*cls*/,
+                                                                 jlong handle, jstring name,
+                                                                 jobject interceptor) {
+  std::string nameStr = jstringToString(env, name);
+  auto* ctx = new InterceptorCtx();
+  ctx->interceptorGlobalRef = env->NewGlobalRef(interceptor);
+
+  return static_cast<jint>(
+      envoy_client_add_interceptor(reinterpret_cast<envoy_client_handle>(handle), nameStr.c_str(),
+                                    interceptorCCallback, ctx));
+}
+
+JNIEXPORT jint JNICALL
+Java_io_envoyproxy_envoyclient_EnvoyClient_nativeRemoveInterceptor(JNIEnv* env, jclass /*cls*/,
+                                                                    jlong handle, jstring name) {
+  std::string nameStr = jstringToString(env, name);
+  return static_cast<jint>(
+      envoy_client_remove_interceptor(reinterpret_cast<envoy_client_handle>(handle),
+                                       nameStr.c_str()));
 }
 
 } // extern "C"

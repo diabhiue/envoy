@@ -201,18 +201,60 @@ envoy_client_status envoy_client_watch_config(envoy_client_handle handle,
   return ENVOY_CLIENT_OK;
 }
 
-envoy_client_status envoy_client_add_interceptor(envoy_client_handle /*handle*/,
-                                                 const char* /*name*/,
-                                                 envoy_client_interceptor_cb /*callback*/,
-                                                 void* /*context*/) {
-  // TODO(Phase 2): Implement interceptor registration.
-  return ENVOY_CLIENT_OK;
+uint64_t envoy_client_apply_request_filters(envoy_client_handle handle,
+                                             const char* cluster_name,
+                                             envoy_client_headers* headers,
+                                             envoy_client_filter_cb callback, void* context) {
+  if (handle == nullptr || cluster_name == nullptr || callback == nullptr) {
+    // Fire the callback with an error so the caller is never left waiting.
+    if (callback != nullptr) {
+      callback(ENVOY_CLIENT_ERROR, nullptr, context);
+    }
+    return 0;
+  }
+  return handle->filter_chain_manager->applyRequestFilters(cluster_name, headers, callback,
+                                                           context);
 }
 
-envoy_client_status envoy_client_remove_interceptor(envoy_client_handle /*handle*/,
-                                                    const char* /*name*/) {
-  // TODO(Phase 2): Implement interceptor removal.
-  return ENVOY_CLIENT_OK;
+uint64_t envoy_client_apply_response_filters(envoy_client_handle handle,
+                                              const char* cluster_name,
+                                              envoy_client_headers* headers,
+                                              envoy_client_filter_cb callback, void* context) {
+  if (handle == nullptr || cluster_name == nullptr || callback == nullptr) {
+    if (callback != nullptr) {
+      callback(ENVOY_CLIENT_ERROR, nullptr, context);
+    }
+    return 0;
+  }
+  return handle->filter_chain_manager->applyResponseFilters(cluster_name, headers, callback,
+                                                            context);
+}
+
+void envoy_client_cancel_filter(envoy_client_handle handle, uint64_t request_id) {
+  if (handle != nullptr) {
+    handle->filter_chain_manager->cancelFilter(request_id);
+  }
+}
+
+void envoy_client_free_headers(envoy_client_headers* headers) {
+  EnvoyClient::FilterChainManager::freeHeaders(headers);
+}
+
+envoy_client_status envoy_client_add_interceptor(envoy_client_handle handle, const char* name,
+                                                 envoy_client_interceptor_cb callback,
+                                                 void* context) {
+  if (handle == nullptr || name == nullptr || callback == nullptr) {
+    return ENVOY_CLIENT_ERROR;
+  }
+  return handle->filter_chain_manager->addInterceptor(name, callback, context);
+}
+
+envoy_client_status envoy_client_remove_interceptor(envoy_client_handle handle,
+                                                    const char* name) {
+  if (handle == nullptr || name == nullptr) {
+    return ENVOY_CLIENT_ERROR;
+  }
+  return handle->filter_chain_manager->removeInterceptor(name);
 }
 
 envoy_client_status envoy_client_set_lb_context_provider(envoy_client_handle handle,

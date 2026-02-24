@@ -16,6 +16,15 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Maximum interceptors supported by the stub. */
+#define MAX_INTERCEPTORS 8
+
+typedef struct {
+  char                        name[128];
+  envoy_client_interceptor_cb callback;
+  void*                       context;
+} stub_interceptor;
+
 /* Concrete definition of the opaque handle type. */
 struct envoy_client_engine {
   envoy_client_lb_context_cb lb_context_cb;
@@ -24,6 +33,8 @@ struct envoy_client_engine {
   void*                      config_user_ctx;
   char                       lb_override[256];
   char                       default_lb_override[256];
+  stub_interceptor            interceptors[MAX_INTERCEPTORS];
+  int                        num_interceptors;
 };
 
 /* ---- Lifecycle ---------------------------------------------------------- */
@@ -149,17 +160,116 @@ envoy_client_status envoy_client_watch_config(envoy_client_handle h, const char*
   return ENVOY_CLIENT_OK;
 }
 
-/* ---- Interceptors (Phase 2 stubs) -------------------------------------- */
+/* ---- Header helpers ---------------------------------------------------- */
+
+/* Deep-copy src headers; caller owns and must call envoy_client_free_headers. */
+static envoy_client_headers* stub_copy_headers(const envoy_client_headers* src) {
+  envoy_client_headers* h = malloc(sizeof(envoy_client_headers));
+  if (!src || src->count == 0 || !src->headers) {
+    h->headers = NULL;
+    h->count = 0;
+    return h;
+  }
+  h->count = src->count;
+  h->headers = calloc(src->count, sizeof(envoy_client_header));
+  for (size_t i = 0; i < src->count; i++) {
+    if (src->headers[i].key)
+      h->headers[i].key = strndup(src->headers[i].key, src->headers[i].key_len);
+    h->headers[i].key_len = src->headers[i].key_len;
+    if (src->headers[i].value)
+      h->headers[i].value = strndup(src->headers[i].value, src->headers[i].value_len);
+    h->headers[i].value_len = src->headers[i].value_len;
+  }
+  return h;
+}
+
+void envoy_client_free_headers(envoy_client_headers* h) {
+  if (!h) return;
+  if (h->headers) {
+    for (size_t i = 0; i < h->count; i++) {
+      free((char*)h->headers[i].key);
+      free((char*)h->headers[i].value);
+    }
+    free(h->headers);
+  }
+  free(h);
+}
+
+/* Run all registered interceptors for a given phase on the working headers. */
+static envoy_client_status stub_run_interceptors(envoy_client_handle h,
+                                                   envoy_client_headers* headers,
+                                                   const char* cluster,
+                                                   envoy_client_interceptor_phase phase) {
+  for (int i = 0; i < h->num_interceptors; i++) {
+    envoy_client_status s =
+        h->interceptors[i].callback(headers, cluster, phase, h->interceptors[i].context);
+    if (s != ENVOY_CLIENT_OK) return s;
+  }
+  return ENVOY_CLIENT_OK;
+}
+
+uint64_t envoy_client_apply_request_filters(envoy_client_handle h, const char* cluster,
+                                             envoy_client_headers* headers,
+                                             envoy_client_filter_cb cb, void* ctx) {
+  if (!h || !cluster || !cb) { if (cb) cb(ENVOY_CLIENT_ERROR, NULL, ctx); return 0; }
+  envoy_client_headers* working = stub_copy_headers(headers);
+  envoy_client_status status = stub_run_interceptors(h, working, cluster,
+                                                      ENVOY_CLIENT_PHASE_PRE_REQUEST);
+  if (status == ENVOY_CLIENT_OK) {
+    /* Server filter chain: pass-through (Phase 2). */
+    status = stub_run_interceptors(h, working, cluster, ENVOY_CLIENT_PHASE_POST_REQUEST);
+  }
+  cb(status, working, ctx);
+  return 0;
+}
+
+uint64_t envoy_client_apply_response_filters(envoy_client_handle h, const char* cluster,
+                                              envoy_client_headers* headers,
+                                              envoy_client_filter_cb cb, void* ctx) {
+  if (!h || !cluster || !cb) { if (cb) cb(ENVOY_CLIENT_ERROR, NULL, ctx); return 0; }
+  envoy_client_headers* working = stub_copy_headers(headers);
+  envoy_client_status status = stub_run_interceptors(h, working, cluster,
+                                                      ENVOY_CLIENT_PHASE_PRE_RESPONSE);
+  if (status == ENVOY_CLIENT_OK) {
+    status = stub_run_interceptors(h, working, cluster, ENVOY_CLIENT_PHASE_POST_RESPONSE);
+  }
+  cb(status, working, ctx);
+  return 0;
+}
+
+void envoy_client_cancel_filter(envoy_client_handle h, uint64_t request_id) {
+  (void)h; (void)request_id; /* No-op: Phase 2 is synchronous. */
+}
+
+/* ---- Interceptors ------------------------------------------------------- */
 
 envoy_client_status envoy_client_add_interceptor(envoy_client_handle h, const char* name,
                                                  envoy_client_interceptor_cb cb, void* ctx) {
-  (void)h; (void)name; (void)cb; (void)ctx;
+  if (!h || !name || !cb) return ENVOY_CLIENT_ERROR;
+  if (h->num_interceptors >= MAX_INTERCEPTORS) return ENVOY_CLIENT_ERROR;
+  for (int i = 0; i < h->num_interceptors; i++) {
+    if (strcmp(h->interceptors[i].name, name) == 0) return ENVOY_CLIENT_ERROR; /* duplicate */
+  }
+  int idx = h->num_interceptors++;
+  snprintf(h->interceptors[idx].name, sizeof(h->interceptors[idx].name), "%s", name);
+  h->interceptors[idx].callback = cb;
+  h->interceptors[idx].context  = ctx;
   return ENVOY_CLIENT_OK;
 }
 
 envoy_client_status envoy_client_remove_interceptor(envoy_client_handle h, const char* name) {
-  (void)h; (void)name;
-  return ENVOY_CLIENT_OK;
+  if (!h || !name) return ENVOY_CLIENT_ERROR;
+  for (int i = 0; i < h->num_interceptors; i++) {
+    if (strcmp(h->interceptors[i].name, name) == 0) {
+      /* Shift remaining interceptors down. */
+      for (int j = i; j < h->num_interceptors - 1; j++) {
+        h->interceptors[j] = h->interceptors[j + 1];
+      }
+      h->num_interceptors--;
+      return ENVOY_CLIENT_OK;
+    }
+  }
+  return ENVOY_CLIENT_ERROR; /* not found */
 }
 
 /* ---- LB context provider ----------------------------------------------- */
