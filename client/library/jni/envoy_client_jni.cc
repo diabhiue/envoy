@@ -348,8 +348,9 @@ Java_io_envoyproxy_envoyclient_EnvoyClient_nativePickEndpoint(JNIEnv* env, jclas
   if (status != ENVOY_CLIENT_OK) return nullptr;
 
   jobject result = buildEndpoint(env, out);
-  // The C layer allocated out.address with new[]; free it.
-  delete[] out.address;
+  // The C ABI allocates the address string on the heap; free it with free()
+  // since the ABI is C-language and callers must not assume C++ new[].
+  free(const_cast<char*>(out.address));
   return result;
 }
 

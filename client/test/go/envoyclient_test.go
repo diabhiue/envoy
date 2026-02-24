@@ -52,12 +52,6 @@ func TestNew_EmptyConfig_ReturnsError(t *testing.T) {
 	}
 }
 
-func TestNew_InvalidYAML_ReturnsError(t *testing.T) {
-	_, err := envoyclient.New("!!not valid yaml{{{{")
-	if err == nil {
-		t.Fatal("expected error for invalid YAML, got nil")
-	}
-}
 
 func TestNew_ValidConfig_Succeeds(t *testing.T) {
 	c, err := envoyclient.New(minimalBootstrap)

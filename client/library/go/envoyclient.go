@@ -22,11 +22,13 @@ package envoyclient
 #include "client/library/c_api/envoy_client.h"
 #include <stdlib.h>
 
-// Forward declarations for the Go-exported C trampolines below.
-extern void goConfigCB(const char* resource_type, const char* resource_name,
-                       envoy_client_config_event event, void* context);
-extern void goLbContextCB(const char* cluster_name,
-                          envoy_client_request_context* ctx, void* context);
+// Trampolines are defined in callbacks.c (CGo requires that preambles contain
+// only declarations, not definitions, when //export is used).
+extern void configCBTrampoline(const char* rt, const char* rn,
+                               envoy_client_config_event event, void* ctx);
+extern void lbContextCBTrampoline(const char* cluster,
+                                  envoy_client_request_context* ctx,
+                                  void* userCtx);
 */
 import "C"
 
@@ -470,7 +472,7 @@ func (c *Client) WatchConfig(resourceType string, cb func(ConfigEvent)) error {
 	status := C.envoy_client_watch_config(
 		c.handle,
 		csType,
-		C.envoy_client_config_cb(C.goConfigCB),
+		C.envoy_client_config_cb(C.configCBTrampoline),
 		unsafe.Pointer(id),
 	)
 	if status != C.ENVOY_CLIENT_OK {
@@ -494,7 +496,7 @@ func (c *Client) SetLbContextProvider(cb func(cluster string, ctx *RequestContex
 
 	status := C.envoy_client_set_lb_context_provider(
 		c.handle,
-		C.envoy_client_lb_context_cb(C.goLbContextCB),
+		C.envoy_client_lb_context_cb(C.lbContextCBTrampoline),
 		unsafe.Pointer(id),
 	)
 	if status != C.ENVOY_CLIENT_OK {

@@ -131,17 +131,15 @@ func (r *envoyResolver) updateAddresses() {
 	for _, ep := range endpoints {
 		addr := resolver.Address{
 			Addr: fmt.Sprintf("%s:%d", ep.Address, ep.Port),
-			// Carry the Endpoint struct through gRPC's attribute system so
-			// the picker can read it without reparsing the address string.
-			BalancerAttributes: attributes.New(endpointAttrKey{}, ep),
+			// Carry both the Endpoint and the cluster name through gRPC's
+			// attribute system. base.PickerBuildInfo only exposes per-address
+			// SubConnInfo, so the cluster name must live on the address itself.
+			BalancerAttributes: attributes.New(endpointAttrKey{}, ep).
+				WithValue(clusterAttrKey{}, r.cluster),
 		}
 		addrs = append(addrs, addr)
 	}
-	_ = r.cc.UpdateState(resolver.State{
-		Addresses: addrs,
-		// Pass the cluster name so the balancer can call PickEndpoint.
-		Attributes: attributes.New(clusterAttrKey{}, r.cluster),
-	})
+	_ = r.cc.UpdateState(resolver.State{Addresses: addrs})
 }
 
 func (r *envoyResolver) ResolveNow(_ resolver.ResolveNowOptions) { r.updateAddresses() }
@@ -175,11 +173,16 @@ func (b *envoyPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 		subconns[sci.Address.Addr] = sc
 	}
 
-	// Extract the cluster name injected by the resolver via State.Attributes.
+	// Extract the cluster name from the first ready SubConn's BalancerAttributes.
+	// The resolver embeds it there (along with the Endpoint) so the picker can
+	// call PickEndpoint with the correct cluster name.
 	cluster := ""
-	if info.ResolverState.Attributes != nil {
-		if v := info.ResolverState.Attributes.Value(clusterAttrKey{}); v != nil {
-			cluster, _ = v.(string)
+	for _, sci := range info.ReadySCs {
+		if sci.Address.BalancerAttributes != nil {
+			if c, ok := sci.Address.BalancerAttributes.Value(clusterAttrKey{}).(string); ok {
+				cluster = c
+				break
+			}
 		}
 	}
 

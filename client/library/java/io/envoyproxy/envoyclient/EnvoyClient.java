@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Main entry point for the Envoy Client Library.
@@ -33,6 +34,7 @@ public final class EnvoyClient implements Closeable {
 
   // Native handle — a C pointer cast to a Java long.
   private final long nativeHandle;
+  private final AtomicBoolean closed = new AtomicBoolean(false);
 
   private EnvoyClient(long nativeHandle) {
     this.nativeHandle = nativeHandle;
@@ -89,7 +91,9 @@ public final class EnvoyClient implements Closeable {
    */
   @Override
   public void close() {
-    nativeDestroy(nativeHandle);
+    if (closed.compareAndSet(false, true)) {
+      nativeDestroy(nativeHandle);
+    }
   }
 
   // ---------------------------------------------------------------------------
