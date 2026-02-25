@@ -14,6 +14,9 @@ envoy_cc_test(
     repository = "@envoy",
     deps = [
         "//client/library/common:engine_lib",
+        "//source/extensions/clusters/static:static_cluster_lib",
+        "//source/extensions/load_balancing_policies/round_robin:config_envoy_extension",
+        "//source/extensions/transport_sockets/raw_buffer:config_envoy_extension",
         "//source/server:options_base",
     ],
 )

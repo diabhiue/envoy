@@ -116,7 +116,7 @@ ConfigStore::pickEndpointWithPolicy(const std::string& cluster_name,
                               lb_policy.find("maglev") != std::string::npos)) {
     auto hash_key_opt = context->computeHashKey();
     if (hash_key_opt.has_value()) {
-      const size_t idx = static_cast<size_t>(hash_key_opt.value().hash) % candidates.size();
+      const size_t idx = static_cast<size_t>(hash_key_opt.value()) % candidates.size();
       ENVOY_LOG(debug, "client: hash-based pick for '{}': index {}/{}", cluster_name, idx,
                 candidates.size());
       return candidates[idx];

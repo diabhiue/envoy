@@ -9,6 +9,7 @@ licenses(["notice"])  # Apache 2
 go_library(
     name = "envoyclient",
     srcs = [
+        "callbacks.c",
         "envoyclient.go",
         "grpc_integration.go",
     ],
