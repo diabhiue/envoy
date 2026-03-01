@@ -1,6 +1,8 @@
 #pragma once
 
+#include "envoy/event/timer.h"
 #include "envoy/server/instance.h"
+#include "envoy/thread_local/thread_local.h"
 
 #include "source/common/common/logger.h"
 #include "source/common/common/thread.h"
@@ -61,23 +63,23 @@ public:
    * @param timeout maximum time to wait.
    * @return true if ready, false if timed out.
    */
-  bool waitReady(absl::Duration timeout = absl::Seconds(30));
+  bool waitReady(absl::Duration timeout = absl::Seconds(30)) override;
 
   /**
    * Terminate the engine. Blocks until the background thread exits.
    */
-  void terminate();
+  void terminate() override;
 
   /**
    * @return true if the engine has been terminated.
    */
-  bool isTerminated() const { return terminated_; }
+  bool isTerminated() const override { return terminated_; }
 
   /**
    * @return the ConfigStore for endpoint resolution and LB decisions.
    * Only valid after waitReady() returns true.
    */
-  ConfigStore& configStore() {
+  ConfigStore& configStore() override {
     ASSERT(config_store_ != nullptr);
     return *config_store_;
   }
@@ -99,6 +101,12 @@ public:
     return server_->dispatcher();
   }
 
+  /**
+   * Run fn on the engine's main dispatcher thread, blocking until fn completes.
+   * If already on the dispatcher thread, fn is called directly.
+   */
+  void runOnDispatcherAndWait(std::function<void()> fn) override;
+
 private:
   void main();
 
@@ -111,8 +119,24 @@ private:
   Server::Instance* server_{nullptr};
   std::unique_ptr<ConfigStore> config_store_;
 
+  // Per-worker keepalive: prevents worker dispatch loops from exiting before
+  // shutdownGlobalThreading() is called. Workers use RunType::Block (libevent
+  // flag=0), which exits the event loop when there are no registered events.
+  // Without listeners, workers have no persistent events. Keeping a long-lived
+  // timer registered on each worker dispatcher prevents the premature exit that
+  // would otherwise trigger ASSERT(shutdown_) in ThreadLocalImpl::shutdownThread.
+  ThreadLocal::SlotPtr worker_keepalive_slot_;
+
   // Background thread
   Thread::PosixThreadPtr main_thread_{nullptr};
+  // pthread ID of the engine's background thread. Set at the start of main()
+  // and used by runOnDispatcherAndWait() to detect calls from the engine thread.
+  // We compare against this rather than disp.isThreadSafe() because isThreadSafe()
+  // returns true for ANY thread before the event loop starts (run_tid_.isEmpty()).
+  pthread_t engine_pthread_{};
+  // Notified once server_ has been assigned (or definitively left null due to
+  // init failure). terminate() waits on this before dereferencing server_.
+  absl::Notification server_started_;
   absl::Notification engine_running_;
   bool terminated_{false};
   Thread::MutexBasicLockable mutex_;

@@ -234,12 +234,13 @@ func goLbContextCB(clusterName *C.char, ctx *C.envoy_client_request_context,
 
 	cb(C.GoString(clusterName), rctx)
 
-	// Write mutations back to the C struct. The native library copies values
-	// before this function returns, so it is safe to free C strings here.
+	// Write mutations back to the C struct. Newly allocated C strings are
+	// transferred to the C caller, which will free them after copying.
+	// Do NOT use defer C.free here: the C code reads these pointers after
+	// this function returns, so freeing them with defer would be a
+	// use-after-free (deferred cleanup runs before the C caller reads back).
 	if rctx.OverrideHost != "" {
-		cs := C.CString(rctx.OverrideHost)
-		defer C.free(unsafe.Pointer(cs))
-		ctx.override_host = cs
+		ctx.override_host = C.CString(rctx.OverrideHost)
 	}
 	if rctx.OverrideHostStrict {
 		ctx.override_host_strict = 1
@@ -248,7 +249,6 @@ func goLbContextCB(clusterName *C.char, ctx *C.envoy_client_request_context,
 	}
 	if rctx.HashKey != "" {
 		cs := C.CString(rctx.HashKey)
-		defer C.free(unsafe.Pointer(cs))
 		ctx.hash_key = cs
 		ctx.hash_key_len = C.size_t(len(rctx.HashKey))
 	}
@@ -492,6 +492,15 @@ func (c *Client) WatchConfig(resourceType string, cb func(ConfigEvent)) error {
 // Only one provider may be active at a time; calling SetLbContextProvider
 // again replaces the previous one.
 func (c *Client) SetLbContextProvider(cb func(cluster string, ctx *RequestContext)) error {
+	if cb == nil {
+		// Clear the provider.
+		status := C.envoy_client_set_lb_context_provider(c.handle, nil, nil)
+		if status != C.ENVOY_CLIENT_OK {
+			return StatusError
+		}
+		return nil
+	}
+
 	id := registerLbCallback(cb)
 
 	status := C.envoy_client_set_lb_context_provider(

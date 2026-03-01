@@ -103,9 +103,17 @@ envoy_client_status envoy_client_pick_endpoint(envoy_client_handle handle,
     mutable_ctx.hash_key_len = ctx.hash_key.size();
     mutable_ctx.metadata = nullptr;
 
+    // Save original pointers so we can detect strings newly allocated by the
+    // callback. The Go binding allocates C strings (via C.CString) and
+    // transfers ownership to us; we must free them after copying.
+    const char* orig_override_host = mutable_ctx.override_host;
+    const char* orig_hash_key = mutable_ctx.hash_key;
+
     handle->lb_context_cb(cluster_name, &mutable_ctx, handle->lb_context_user_ctx);
 
     // Read back any fields the callback may have added or changed.
+    // Free any strings that were newly allocated by the callback (pointer
+    // differs from the original) after copying them into ctx.
     if (mutable_ctx.path != nullptr) {
       ctx.path = mutable_ctx.path;
     }
@@ -114,10 +122,16 @@ envoy_client_status envoy_client_pick_endpoint(envoy_client_handle handle,
     }
     if (mutable_ctx.override_host != nullptr) {
       ctx.override_host = mutable_ctx.override_host;
+      if (mutable_ctx.override_host != orig_override_host) {
+        free(const_cast<char*>(mutable_ctx.override_host));
+      }
     }
     ctx.override_host_strict = mutable_ctx.override_host_strict != 0;
     if (mutable_ctx.hash_key != nullptr && mutable_ctx.hash_key_len > 0) {
       ctx.hash_key = std::string(mutable_ctx.hash_key, mutable_ctx.hash_key_len);
+      if (mutable_ctx.hash_key != orig_hash_key) {
+        free(const_cast<char*>(mutable_ctx.hash_key));
+      }
     }
   }
 

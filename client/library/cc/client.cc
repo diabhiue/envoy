@@ -39,8 +39,16 @@ bool Client::waitReady(int timeout_seconds) {
 }
 
 std::vector<Endpoint> Client::resolve(const std::string& cluster_name) {
+  // ConfigStore::resolve() calls ClusterManager::getThreadLocalCluster(), which
+  // requires the calling thread to be registered with Envoy TLS. External threads
+  // (e.g. Go goroutines) are not registered, so we dispatch to the engine's main
+  // dispatcher thread, which is always TLS-registered.
   std::vector<Envoy::Client::EndpointInfo> internal_endpoints;
-  if (!engine_->configStore().resolve(cluster_name, internal_endpoints)) {
+  bool found = false;
+  engine_->runOnDispatcherAndWait([&]() {
+    found = engine_->configStore().resolve(cluster_name, internal_endpoints);
+  });
+  if (!found) {
     return {};
   }
 
@@ -54,10 +62,14 @@ std::vector<Endpoint> Client::resolve(const std::string& cluster_name) {
 
 absl::optional<Endpoint> Client::pickEndpoint(const std::string& cluster_name,
                                               const RequestContext& ctx) {
+  // Same TLS constraint as resolve() — dispatch to the engine's main dispatcher.
   Envoy::Client::ClientLoadBalancerContext lb_ctx(ctx.hash_key, ctx.override_host,
                                                   ctx.override_host_strict, ctx.path,
                                                   ctx.authority);
-  auto result = engine_->configStore().pickEndpoint(cluster_name, &lb_ctx);
+  absl::optional<Envoy::Client::EndpointInfo> result;
+  engine_->runOnDispatcherAndWait([&]() {
+    result = engine_->configStore().pickEndpoint(cluster_name, &lb_ctx);
+  });
   if (!result.has_value()) {
     return absl::nullopt;
   }

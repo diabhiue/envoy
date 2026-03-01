@@ -65,6 +65,12 @@ envoy_cc_library(
         "//source/server:listener_hooks_lib",
         "//source/server:null_overload_manager_lib",
         "//source/server:options_base",
+        # Minimal extension set required for static-cluster bootstrap configs.
+        # Without these, the engine cannot start when the bootstrap references
+        # envoy.cluster.static, round_robin LB, or the raw-buffer transport.
+        "//source/extensions/clusters/static:static_cluster_lib",
+        "//source/extensions/load_balancing_policies/round_robin:config_envoy_extension",
+        "//source/extensions/transport_sockets/raw_buffer:config_envoy_extension",
         "@com_google_absl//absl/synchronization",
     ],
 )
