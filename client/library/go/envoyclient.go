@@ -29,6 +29,10 @@ extern void configCBTrampoline(const char* rt, const char* rn,
 extern void lbContextCBTrampoline(const char* cluster,
                                   envoy_client_request_context* ctx,
                                   void* userCtx);
+extern envoy_client_status interceptorCBTrampoline(envoy_client_headers* headers,
+                                                   const char* cluster_name,
+                                                   envoy_client_interceptor_phase phase,
+                                                   void* user_ctx);
 */
 import "C"
 
@@ -513,4 +517,208 @@ func (c *Client) SetLbContextProvider(cb func(cluster string, ctx *RequestContex
 		return StatusError
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Interceptors
+// ---------------------------------------------------------------------------
+
+// InterceptorFunc is a Go interceptor callback. It receives the current request
+// or response headers as a map and the target cluster name. It may modify the
+// map and return it. Return nil, StatusDenied to reject the request.
+//
+// Phase constants: 0=PRE_REQUEST, 1=POST_REQUEST, 2=PRE_RESPONSE, 3=POST_RESPONSE.
+type InterceptorFunc func(headers map[string]string, cluster string, phase int) (map[string]string, Status)
+
+// AddInterceptor registers a Go interceptor. Interceptors run in the order
+// they were registered. If an interceptor with the same name exists it is
+// replaced. Thread-safe.
+//
+// The interceptor function is called on the engine's dispatcher thread during
+// filter chain execution; it must not block or call back into the client.
+func (c *Client) AddInterceptor(name string, fn InterceptorFunc) error {
+	if name == "" || fn == nil {
+		return errors.New("envoyclient: interceptor name and callback must not be empty")
+	}
+	csName := C.CString(name)
+	defer C.free(unsafe.Pointer(csName))
+
+	// Bridge: the C interceptor callback translates envoy_client_headers* ↔ Go map.
+	// We store the Go function under a numeric key and call it from a C trampoline.
+	id := registerInterceptorCallback(fn)
+
+	status := C.envoy_client_add_interceptor(
+		c.handle,
+		csName,
+		C.envoy_client_interceptor_cb(C.interceptorCBTrampoline),
+		unsafe.Pointer(id),
+	)
+	if status != C.ENVOY_CLIENT_OK {
+		unregisterInterceptorCallback(id)
+		return StatusError
+	}
+	return nil
+}
+
+// RemoveInterceptor removes the interceptor with the given name. No-op if not found.
+func (c *Client) RemoveInterceptor(name string) {
+	csName := C.CString(name)
+	defer C.free(unsafe.Pointer(csName))
+	C.envoy_client_remove_interceptor(c.handle, csName)
+}
+
+// ---------------------------------------------------------------------------
+// Filter application
+// ---------------------------------------------------------------------------
+
+// ApplyRequestFilters runs the request filter pipeline (registered interceptors
+// + native Envoy filters) for a request targeting clusterName.
+//
+// It returns the (possibly modified) headers on success, or an error if any
+// filter/interceptor denied the request (error will be StatusDenied).
+//
+// Blocks until the complete filter chain has run. Safe to call from any goroutine.
+func (c *Client) ApplyRequestFilters(clusterName string,
+	inHeaders map[string]string) (map[string]string, error) {
+	csCluster := C.CString(clusterName)
+	defer C.free(unsafe.Pointer(csCluster))
+
+	cIn := goMapToCHeaders(inHeaders)
+	defer freeCHeadersArray(&cIn)
+
+	var cOut C.envoy_client_headers
+	status := C.envoy_client_apply_request_filters(c.handle, csCluster, &cIn, &cOut)
+	if status != C.ENVOY_CLIENT_OK {
+		return nil, StatusDenied
+	}
+	defer C.envoy_client_free_headers(&cOut)
+	return cHeadersToGoMap(&cOut), nil
+}
+
+// ApplyResponseFilters runs the response filter pipeline for a response from
+// clusterName. Mirrors ApplyRequestFilters.
+func (c *Client) ApplyResponseFilters(clusterName string,
+	inHeaders map[string]string) (map[string]string, error) {
+	csCluster := C.CString(clusterName)
+	defer C.free(unsafe.Pointer(csCluster))
+
+	cIn := goMapToCHeaders(inHeaders)
+	defer freeCHeadersArray(&cIn)
+
+	var cOut C.envoy_client_headers
+	status := C.envoy_client_apply_response_filters(c.handle, csCluster, &cIn, &cOut)
+	if status != C.ENVOY_CLIENT_OK {
+		return nil, StatusDenied
+	}
+	defer C.envoy_client_free_headers(&cOut)
+	return cHeadersToGoMap(&cOut), nil
+}
+
+// ---------------------------------------------------------------------------
+// Go interceptor registry (used by AddInterceptor / interceptorCBTrampoline)
+// ---------------------------------------------------------------------------
+
+var (
+	interceptorCallbacks   = make(map[uintptr]InterceptorFunc)
+	interceptorCallbackSeq uintptr
+)
+
+func registerInterceptorCallback(fn InterceptorFunc) uintptr {
+	callbackMu.Lock()
+	defer callbackMu.Unlock()
+	interceptorCallbackSeq++
+	id := interceptorCallbackSeq
+	interceptorCallbacks[id] = fn
+	return id
+}
+
+func unregisterInterceptorCallback(id uintptr) {
+	callbackMu.Lock()
+	defer callbackMu.Unlock()
+	delete(interceptorCallbacks, id)
+}
+
+// goInterceptorCB is the Go side of the interceptor trampoline.
+// It is called from the C trampoline (interceptorCBTrampoline in callbacks.c)
+// and invokes the registered Go InterceptorFunc.
+//
+//export goInterceptorCB
+func goInterceptorCB(cHeaders *C.envoy_client_headers, clusterName *C.char,
+	phase C.envoy_client_interceptor_phase, userCtx unsafe.Pointer) C.envoy_client_status {
+
+	id := uintptr(userCtx)
+	callbackMu.RLock()
+	fn := interceptorCallbacks[id]
+	callbackMu.RUnlock()
+	if fn == nil {
+		return C.ENVOY_CLIENT_OK
+	}
+
+	// Build Go map from C headers (read-only view for now; Phase 3 will add mutation).
+	goMap := cHeadersToGoMap(cHeaders)
+	cluster := C.GoString(clusterName)
+
+	_, status := fn(goMap, cluster, int(phase))
+	if status == StatusDenied {
+		return C.ENVOY_CLIENT_DENIED
+	}
+	return C.ENVOY_CLIENT_OK
+}
+
+// ---------------------------------------------------------------------------
+// Header conversion helpers
+// ---------------------------------------------------------------------------
+
+// goMapToCHeaders converts a Go map[string]string to a C envoy_client_headers.
+// The caller is responsible for calling freeCHeadersArray when done.
+func goMapToCHeaders(m map[string]string) C.envoy_client_headers {
+	if len(m) == 0 {
+		return C.envoy_client_headers{}
+	}
+	n := C.size_t(len(m))
+	arr := (*C.envoy_client_header)(C.calloc(n, C.size_t(C.sizeof_envoy_client_header)))
+	sl := (*[1 << 20]C.envoy_client_header)(unsafe.Pointer(arr))[:len(m):len(m)]
+	i := 0
+	for k, v := range m {
+		sl[i].key = C.CString(k)
+		sl[i].key_len = C.size_t(len(k))
+		sl[i].value = C.CString(v)
+		sl[i].value_len = C.size_t(len(v))
+		i++
+	}
+	return C.envoy_client_headers{headers: arr, count: n}
+}
+
+// freeCHeadersArray frees memory allocated by goMapToCHeaders.
+func freeCHeadersArray(h *C.envoy_client_headers) {
+	if h == nil || h.headers == nil {
+		return
+	}
+	n := int(h.count)
+	sl := (*[1 << 20]C.envoy_client_header)(unsafe.Pointer(h.headers))[:n:n]
+	for _, entry := range sl {
+		C.free(unsafe.Pointer(entry.key))
+		C.free(unsafe.Pointer(entry.value))
+	}
+	C.free(unsafe.Pointer(h.headers))
+	h.headers = nil
+	h.count = 0
+}
+
+// cHeadersToGoMap converts a C envoy_client_headers into a Go map.
+func cHeadersToGoMap(h *C.envoy_client_headers) map[string]string {
+	if h == nil || h.count == 0 || h.headers == nil {
+		return map[string]string{}
+	}
+	n := int(h.count)
+	sl := (*[1 << 20]C.envoy_client_header)(unsafe.Pointer(h.headers))[:n:n]
+	result := make(map[string]string, n)
+	for _, entry := range sl {
+		if entry.key != nil && entry.value != nil {
+			k := C.GoStringN(entry.key, C.int(entry.key_len))
+			v := C.GoStringN(entry.value, C.int(entry.value_len))
+			result[k] = v
+		}
+	}
+	return result
 }

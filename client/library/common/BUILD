@@ -9,11 +9,32 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "headless_filter_chain_lib",
+    srcs = ["headless_filter_chain.cc"],
+    hdrs = ["headless_filter_chain.h"],
+    repository = "@envoy",
+    deps = [
+        "//envoy/event:dispatcher_interface",
+        "//envoy/http:filter_interface",
+        "//envoy/http:filter_factory_interface",
+        "//envoy/http:header_map_interface",
+        "//envoy/upstream:cluster_manager_interface",
+        "//source/common/common:logger_lib",
+        "//source/common/common:scope_tracked_object_stack_lib",
+        "//source/common/http:header_map_lib",
+        "//source/common/stream_info:stream_info_lib",
+        "//source/common/tracing:null_span_lib",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+envoy_cc_library(
     name = "engine_interface_lib",
     hdrs = ["engine_interface.h"],
     repository = "@envoy",
     deps = [
         ":config_store_lib",
+        ":headless_filter_chain_lib",
         "@com_google_absl//absl/time",
     ],
 )
@@ -29,6 +50,7 @@ envoy_cc_library(
         "//envoy/upstream:thread_local_cluster_interface",
         "//source/common/common:logger_lib",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/synchronization",
     ],
 )
@@ -54,6 +76,7 @@ envoy_cc_library(
     deps = [
         ":config_store_lib",
         ":engine_interface_lib",
+        ":headless_filter_chain_lib",
         "//envoy/server:instance_interface",
         "//source/common/common:logger_lib",
         "//source/common/common:thread_lib",

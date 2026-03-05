@@ -3,6 +3,7 @@
 #include "envoy/event/timer.h"
 #include "envoy/server/instance.h"
 #include "envoy/thread_local/thread_local.h"
+#include "envoy/upstream/cluster_manager.h"
 
 #include "source/common/common/logger.h"
 #include "source/common/common/thread.h"
@@ -14,6 +15,7 @@
 
 #include "client/library/common/config_store.h"
 #include "client/library/common/engine_interface.h"
+#include "client/library/common/headless_filter_chain.h"
 
 #include "source/common/common/posix/thread_impl.h"
 
@@ -102,6 +104,11 @@ public:
   }
 
   /**
+   * @return the HeadlessFilterChain. Valid after waitReady() returns true.
+   */
+  HeadlessFilterChain* filterChain() override { return filter_chain_.get(); }
+
+  /**
    * Run fn on the engine's main dispatcher thread, blocking until fn completes.
    * If already on the dispatcher thread, fn is called directly.
    */
@@ -118,6 +125,10 @@ private:
   std::unique_ptr<StrippedMainBase> base_;
   Server::Instance* server_{nullptr};
   std::unique_ptr<ConfigStore> config_store_;
+  // RAII handle keeping the ConfigStore's cluster update callbacks registered.
+  Upstream::ClusterUpdateCallbacksHandlePtr cluster_update_callbacks_handle_;
+  // Filter chain for running HTTP filters and interceptors outside of HCM.
+  std::unique_ptr<HeadlessFilterChain> filter_chain_;
 
   // Per-worker keepalive: prevents worker dispatch loops from exiting before
   // shutdownGlobalThreading() is called. Workers use RunType::Block (libevent

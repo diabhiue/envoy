@@ -2,8 +2,12 @@
 
 #include "source/server/options_impl_base.h"
 
+#include "source/common/http/header_map_impl.h"
+
 #include "client/library/common/engine.h"
 #include "client/library/common/lb_context.h"
+
+#include "absl/synchronization/notification.h"
 
 namespace EnvoyClient {
 
@@ -117,6 +121,107 @@ void Client::shutdown() {
   if (engine_ && !engine_->isTerminated()) {
     engine_->terminate();
   }
+}
+
+void Client::addInterceptor(Envoy::Client::ClientInterceptor interceptor) {
+  auto* fc = engine_->filterChain();
+  if (fc != nullptr) {
+    fc->addInterceptor(std::move(interceptor));
+  }
+}
+
+void Client::removeInterceptor(const std::string& name) {
+  auto* fc = engine_->filterChain();
+  if (fc != nullptr) {
+    fc->removeInterceptor(name);
+  }
+}
+
+Status Client::applyRequestFilters(const std::string& cluster_name,
+                                   Http::RequestHeaderMap& headers) {
+  auto* fc = engine_->filterChain();
+  if (fc == nullptr) {
+    return Status::Ok;
+  }
+
+  // Clone the headers so applyRequestFilters can take ownership via shared_ptr.
+  auto owned = Http::RequestHeaderMapImpl::create();
+  headers.iterate([&owned](const Http::HeaderEntry& entry) {
+    owned->addCopy(Http::LowerCaseString(entry.key().getStringView()),
+                   entry.value().getStringView());
+    return Http::HeaderMap::Iterate::Continue;
+  });
+
+  // Run the filter chain on the dispatcher thread and wait for completion.
+  Envoy::Client::FilterChainResult result;
+  Http::RequestHeaderMapPtr result_headers;
+  absl::Notification done;
+
+  engine_->runOnDispatcherAndWait([&]() {
+    fc->applyRequestFilters(
+        cluster_name, std::move(owned),
+        [&](Envoy::Client::FilterChainResult r, Http::RequestHeaderMapPtr h) {
+          result = r;
+          result_headers = std::move(h);
+          done.Notify();
+        });
+  });
+
+  done.WaitForNotification();
+
+  if (result.status == Envoy::Client::FilterChainResult::Status::Allow && result_headers) {
+    // Write back the (potentially modified) headers.
+    headers.clear();
+    result_headers->iterate([&headers](const Http::HeaderEntry& entry) {
+      headers.addCopy(Http::LowerCaseString(entry.key().getStringView()),
+                      entry.value().getStringView());
+      return Http::HeaderMap::Iterate::Continue;
+    });
+    return Status::Ok;
+  }
+  return Status::Denied;
+}
+
+Status Client::applyResponseFilters(const std::string& cluster_name,
+                                    Http::ResponseHeaderMap& headers) {
+  auto* fc = engine_->filterChain();
+  if (fc == nullptr) {
+    return Status::Ok;
+  }
+
+  auto owned = Http::ResponseHeaderMapImpl::create();
+  headers.iterate([&owned](const Http::HeaderEntry& entry) {
+    owned->addCopy(Http::LowerCaseString(entry.key().getStringView()),
+                   entry.value().getStringView());
+    return Http::HeaderMap::Iterate::Continue;
+  });
+
+  Envoy::Client::FilterChainResult result;
+  Http::ResponseHeaderMapPtr result_headers;
+  absl::Notification done;
+
+  engine_->runOnDispatcherAndWait([&]() {
+    fc->applyResponseFilters(
+        cluster_name, std::move(owned),
+        [&](Envoy::Client::FilterChainResult r, Http::ResponseHeaderMapPtr h) {
+          result = r;
+          result_headers = std::move(h);
+          done.Notify();
+        });
+  });
+
+  done.WaitForNotification();
+
+  if (result.status == Envoy::Client::FilterChainResult::Status::Allow && result_headers) {
+    headers.clear();
+    result_headers->iterate([&headers](const Http::HeaderEntry& entry) {
+      headers.addCopy(Http::LowerCaseString(entry.key().getStringView()),
+                      entry.value().getStringView());
+      return Http::HeaderMap::Iterate::Continue;
+    });
+    return Status::Ok;
+  }
+  return Status::Denied;
 }
 
 } // namespace EnvoyClient

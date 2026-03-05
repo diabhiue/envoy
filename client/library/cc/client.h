@@ -7,6 +7,7 @@
 
 #include "client/library/common/config_store.h"
 #include "client/library/common/engine_interface.h"
+#include "client/library/common/headless_filter_chain.h"
 
 namespace EnvoyClient {
 
@@ -133,6 +134,43 @@ public:
    */
   void reportResult(const std::string& address, uint32_t port, uint32_t status_code,
                     uint64_t latency_ms);
+
+  // ---------------------------------------------------------------------------
+  // Filter chain and interceptors
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a client interceptor. If an interceptor with the same name already
+   * exists it is replaced. Thread-safe.
+   * @param interceptor the interceptor definition (name + callbacks).
+   */
+  void addInterceptor(Envoy::Client::ClientInterceptor interceptor);
+
+  /**
+   * Remove a previously registered interceptor by name. Thread-safe.
+   * @param name the interceptor name to remove.
+   */
+  void removeInterceptor(const std::string& name);
+
+  /**
+   * Apply the request filter pipeline (interceptors + native filter chain) to
+   * request headers. Blocks until the pipeline completes (including async filters).
+   * The headers are modified in-place by the filter chain.
+   *
+   * @param cluster_name the target cluster name (passed to interceptors).
+   * @param headers request headers to process; modified in-place on Allow.
+   * @return Status::Ok if allowed, Status::Denied if any filter/interceptor denied.
+   */
+  Status applyRequestFilters(const std::string& cluster_name, Http::RequestHeaderMap& headers);
+
+  /**
+   * Apply the response filter pipeline to response headers.
+   *
+   * @param cluster_name the source cluster name.
+   * @param headers response headers to process; modified in-place on Allow.
+   * @return Status::Ok if allowed, Status::Denied if any filter/interceptor denied.
+   */
+  Status applyResponseFilters(const std::string& cluster_name, Http::ResponseHeaderMap& headers);
 
   /**
    * Shut down the client engine.

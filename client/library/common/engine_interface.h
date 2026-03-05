@@ -5,6 +5,7 @@
 #include "absl/time/time.h"
 
 #include "client/library/common/config_store.h"
+#include "client/library/common/headless_filter_chain.h"
 
 namespace Envoy {
 namespace Client {
@@ -23,6 +24,12 @@ public:
   virtual void terminate() = 0;
   virtual bool isTerminated() const = 0;
   virtual ConfigStore& configStore() = 0;
+
+  /**
+   * @return the HeadlessFilterChain for this engine, or nullptr if not available
+   * (e.g. in test mock engines).  Valid after waitReady() returns true.
+   */
+  virtual HeadlessFilterChain* filterChain() { return nullptr; }
 
   /**
    * Run fn on the engine's main dispatcher thread, blocking until fn completes.

@@ -15,6 +15,10 @@ extern void goConfigCB(char* resource_type, char* resource_name,
                        envoy_client_config_event event, void* context);
 extern void goLbContextCB(char* cluster_name,
                           envoy_client_request_context* ctx, void* context);
+extern envoy_client_status goInterceptorCB(envoy_client_headers* headers,
+                                           char* cluster_name,
+                                           envoy_client_interceptor_phase phase,
+                                           void* user_ctx);
 
 void configCBTrampoline(const char* rt, const char* rn,
                         envoy_client_config_event event, void* ctx) {
@@ -24,4 +28,11 @@ void configCBTrampoline(const char* rt, const char* rn,
 void lbContextCBTrampoline(const char* cluster,
                            envoy_client_request_context* ctx, void* userCtx) {
   goLbContextCB((char*)cluster, ctx, userCtx);
+}
+
+envoy_client_status interceptorCBTrampoline(envoy_client_headers* headers,
+                                            const char* cluster_name,
+                                            envoy_client_interceptor_phase phase,
+                                            void* user_ctx) {
+  return goInterceptorCB(headers, (char*)cluster_name, phase, user_ctx);
 }

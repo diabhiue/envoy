@@ -150,6 +150,33 @@ envoy_client_status envoy_client_add_interceptor(envoy_client_handle handle, con
 // Remove a previously registered interceptor.
 envoy_client_status envoy_client_remove_interceptor(envoy_client_handle handle, const char* name);
 
+// --- Filter Application ---
+//
+// Apply the request/response filter pipeline (native filters + interceptors)
+// to a set of headers. These calls are synchronous: they block until the
+// entire filter chain (including any async callouts) completes.
+//
+// in_headers:  Input headers (read-only, may be NULL for an empty set).
+// out_headers: Populated with the headers after filter processing. The struct
+//              must be passed in zeroed; on ENVOY_CLIENT_OK the caller must
+//              free it with envoy_client_free_headers(). Not modified on deny.
+//
+// Returns ENVOY_CLIENT_OK if all filters allowed,
+//         ENVOY_CLIENT_DENIED if any filter/interceptor denied the request.
+
+envoy_client_status
+envoy_client_apply_request_filters(envoy_client_handle handle, const char* cluster_name,
+                                   const envoy_client_headers* in_headers,
+                                   envoy_client_headers* out_headers);
+
+envoy_client_status
+envoy_client_apply_response_filters(envoy_client_handle handle, const char* cluster_name,
+                                    const envoy_client_headers* in_headers,
+                                    envoy_client_headers* out_headers);
+
+// Free headers returned by envoy_client_apply_request/response_filters.
+void envoy_client_free_headers(envoy_client_headers* headers);
+
 // --- LB Context Provider ---
 
 // Callback invoked during pick_endpoint to let the app enrich the LB context.

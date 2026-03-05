@@ -10,6 +10,29 @@ namespace Client {
 ConfigStore::ConfigStore(Upstream::ClusterManager& cluster_manager)
     : cluster_manager_(cluster_manager) {}
 
+Upstream::ClusterUpdateCallbacksHandlePtr ConfigStore::activateClusterCallbacks() {
+  return cluster_manager_.addThreadLocalClusterUpdateCallbacks(*this);
+}
+
+void ConfigStore::onClusterAddOrUpdate(absl::string_view cluster_name,
+                                       Upstream::ThreadLocalClusterCommand&) {
+  const std::string name(cluster_name);
+  if (known_clusters_.insert(name).second) {
+    // First time we see this cluster name → Added.
+    ENVOY_LOG(debug, "client: cluster '{}' added via xDS", name);
+    notifyConfigChange("cluster", name, ConfigEvent::Added);
+  } else {
+    ENVOY_LOG(debug, "client: cluster '{}' updated via xDS", name);
+    notifyConfigChange("cluster", name, ConfigEvent::Updated);
+  }
+}
+
+void ConfigStore::onClusterRemoval(const std::string& cluster_name) {
+  known_clusters_.erase(cluster_name);
+  ENVOY_LOG(debug, "client: cluster '{}' removed via xDS", cluster_name);
+  notifyConfigChange("cluster", cluster_name, ConfigEvent::Removed);
+}
+
 bool ConfigStore::resolve(const std::string& cluster_name,
                           std::vector<EndpointInfo>& out_endpoints) {
   auto* tlc = cluster_manager_.getThreadLocalCluster(cluster_name);

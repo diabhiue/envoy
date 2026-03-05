@@ -11,6 +11,7 @@
 #include "source/common/common/logger.h"
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/synchronization/mutex.h"
 
 namespace Envoy {
@@ -54,9 +55,22 @@ using ConfigWatchCallback =
  * For LB policy overrides: the ConfigStore maintains client-side override state
  * that takes precedence over server-configured policies.
  */
-class ConfigStore : public Logger::Loggable<Logger::Id::client> {
+class ConfigStore : public Upstream::ClusterUpdateCallbacks,
+                    public Logger::Loggable<Logger::Id::client> {
 public:
   explicit ConfigStore(Upstream::ClusterManager& cluster_manager);
+
+  /**
+   * Activate cluster update callbacks so this ConfigStore receives cluster add/update/remove
+   * notifications from the ClusterManager. Must be called from the main dispatcher thread after
+   * the server is initialized. Returns the RAII handle that keeps the subscription alive.
+   */
+  Upstream::ClusterUpdateCallbacksHandlePtr activateClusterCallbacks();
+
+  // Upstream::ClusterUpdateCallbacks
+  void onClusterAddOrUpdate(absl::string_view cluster_name,
+                            Upstream::ThreadLocalClusterCommand& get_cluster) override;
+  void onClusterRemoval(const std::string& cluster_name) override;
 
   /**
    * Resolve all healthy endpoints for a cluster.
@@ -151,6 +165,10 @@ private:
   absl::Mutex watchers_mutex_;
   std::vector<std::pair<std::string, ConfigWatchCallback>> watchers_
       ABSL_GUARDED_BY(watchers_mutex_);
+
+  // Cluster names seen so far (used by onClusterAddOrUpdate to tell Added from Updated).
+  // Accessed only from the main dispatcher thread; no mutex needed.
+  absl::flat_hash_set<std::string> known_clusters_;
 };
 
 } // namespace Client

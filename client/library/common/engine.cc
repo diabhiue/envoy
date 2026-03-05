@@ -160,8 +160,16 @@ void ClientEngine::main() {
     return;
   }
 
-  // Create the ConfigStore backed by ClusterManager.
+  // Create the ConfigStore backed by ClusterManager and subscribe to cluster updates.
+  // addThreadLocalClusterUpdateCallbacks() must be called from the main dispatcher
+  // thread (here), and fires onClusterAddOrUpdate / onClusterRemoval for each CDS push.
   config_store_ = std::make_unique<ConfigStore>(server_->clusterManager());
+  cluster_update_callbacks_handle_ = config_store_->activateClusterCallbacks();
+
+  // Create the HeadlessFilterChain. Filter factories and interceptors are added later
+  // (via addFilterFactory() / addInterceptor()) as configuration arrives.
+  filter_chain_ = std::make_unique<HeadlessFilterChain>(
+      server_->dispatcher(), server_->clusterManager(), real_time_system_);
 
   // Register a keepalive TLS slot to prevent worker dispatch loops from exiting
   // before shutdownGlobalThreading() is called.
@@ -204,7 +212,11 @@ void ClientEngine::main() {
     base_->runServer();
   } // postinit_handle deregistered here, while the server lifecycle notifier is still alive.
 
-  // Event loop exited — clean up.
+  // Event loop exited — clean up in reverse construction order.
+  // Release the cluster callbacks handle before config_store_ so the
+  // ClusterManager doesn't call into a destroyed ConfigStore.
+  cluster_update_callbacks_handle_.reset();
+  filter_chain_.reset();
   config_store_.reset();
   worker_keepalive_slot_.reset();
   base_.reset();

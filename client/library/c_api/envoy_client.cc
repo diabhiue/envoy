@@ -3,6 +3,9 @@
 #include <cstring>
 #include <string>
 
+#include "envoy/http/header_map.h"
+#include "source/common/http/header_map_impl.h"
+
 extern "C" {
 
 envoy_client_handle envoy_client_create(const char* bootstrap_config, size_t config_len) {
@@ -215,18 +218,197 @@ envoy_client_status envoy_client_watch_config(envoy_client_handle handle,
   return ENVOY_CLIENT_OK;
 }
 
-envoy_client_status envoy_client_add_interceptor(envoy_client_handle /*handle*/,
-                                                 const char* /*name*/,
-                                                 envoy_client_interceptor_cb /*callback*/,
-                                                 void* /*context*/) {
-  // TODO(Phase 2): Implement interceptor registration.
+envoy_client_status envoy_client_add_interceptor(envoy_client_handle handle, const char* name,
+                                                 envoy_client_interceptor_cb callback,
+                                                 void* context) {
+  if (handle == nullptr || name == nullptr || callback == nullptr) {
+    return ENVOY_CLIENT_ERROR;
+  }
+
+  // Wrap the C callback in a C++ interceptor that converts Http::RequestHeaderMap
+  // ↔ envoy_client_headers so the C callback can inspect (but not structurally modify)
+  // the request headers.
+  Envoy::Client::ClientInterceptor interceptor;
+  interceptor.name = name;
+
+  interceptor.on_request = [callback, context](Envoy::Http::RequestHeaderMap& headers,
+                                               const std::string& cluster,
+                                               Envoy::Client::InterceptorPhase phase) -> bool {
+    // Build a temporary envoy_client_headers view of the Http::RequestHeaderMap.
+    // Point directly into Envoy's internal string storage (valid during the callback).
+    std::vector<envoy_client_header> c_headers;
+    headers.iterate([&c_headers](const Envoy::Http::HeaderEntry& entry) {
+      c_headers.push_back(
+          {entry.key().getStringView().data(), entry.key().getStringView().size(),
+           entry.value().getStringView().data(), entry.value().getStringView().size()});
+      return Envoy::Http::HeaderMap::Iterate::Continue;
+    });
+    envoy_client_headers c_hdr_map;
+    c_hdr_map.headers = c_headers.empty() ? nullptr : c_headers.data();
+    c_hdr_map.count = c_headers.size();
+
+    const auto c_phase = static_cast<envoy_client_interceptor_phase>(phase);
+    const envoy_client_status status =
+        callback(&c_hdr_map, cluster.c_str(), c_phase, context);
+    return status == ENVOY_CLIENT_OK;
+  };
+
+  interceptor.on_response = [callback, context](Envoy::Http::ResponseHeaderMap& headers,
+                                                const std::string& cluster,
+                                                Envoy::Client::InterceptorPhase phase) -> bool {
+    std::vector<envoy_client_header> c_headers;
+    headers.iterate([&c_headers](const Envoy::Http::HeaderEntry& entry) {
+      c_headers.push_back(
+          {entry.key().getStringView().data(), entry.key().getStringView().size(),
+           entry.value().getStringView().data(), entry.value().getStringView().size()});
+      return Envoy::Http::HeaderMap::Iterate::Continue;
+    });
+    envoy_client_headers c_hdr_map;
+    c_hdr_map.headers = c_headers.empty() ? nullptr : c_headers.data();
+    c_hdr_map.count = c_headers.size();
+
+    const auto c_phase = static_cast<envoy_client_interceptor_phase>(phase);
+    const envoy_client_status status =
+        callback(&c_hdr_map, cluster.c_str(), c_phase, context);
+    return status == ENVOY_CLIENT_OK;
+  };
+
+  handle->client->addInterceptor(std::move(interceptor));
   return ENVOY_CLIENT_OK;
 }
 
-envoy_client_status envoy_client_remove_interceptor(envoy_client_handle /*handle*/,
-                                                    const char* /*name*/) {
-  // TODO(Phase 2): Implement interceptor removal.
+envoy_client_status envoy_client_remove_interceptor(envoy_client_handle handle,
+                                                    const char* name) {
+  if (handle == nullptr || name == nullptr) {
+    return ENVOY_CLIENT_ERROR;
+  }
+  handle->client->removeInterceptor(name);
   return ENVOY_CLIENT_OK;
+}
+
+// --- Filter Application ---
+
+namespace {
+
+// Convert envoy_client_headers to Http::RequestHeaderMap.
+Envoy::Http::RequestHeaderMapPtr fromCHeaders(const envoy_client_headers* in_headers) {
+  auto hdr_map = Envoy::Http::RequestHeaderMapImpl::create();
+  if (in_headers != nullptr) {
+    for (size_t i = 0; i < in_headers->count; ++i) {
+      const auto& h = in_headers->headers[i];
+      if (h.key && h.value) {
+        hdr_map->addCopy(Envoy::Http::LowerCaseString(std::string(h.key, h.key_len)),
+                         std::string(h.value, h.value_len));
+      }
+    }
+  }
+  return hdr_map;
+}
+
+// Convert envoy_client_headers to Http::ResponseHeaderMap.
+Envoy::Http::ResponseHeaderMapPtr fromCResponseHeaders(const envoy_client_headers* in_headers) {
+  auto hdr_map = Envoy::Http::ResponseHeaderMapImpl::create();
+  if (in_headers != nullptr) {
+    for (size_t i = 0; i < in_headers->count; ++i) {
+      const auto& h = in_headers->headers[i];
+      if (h.key && h.value) {
+        hdr_map->addCopy(Envoy::Http::LowerCaseString(std::string(h.key, h.key_len)),
+                         std::string(h.value, h.value_len));
+      }
+    }
+  }
+  return hdr_map;
+}
+
+// Populate an envoy_client_headers struct from an Http::HeaderMap.
+// Allocates memory that the caller must free with envoy_client_free_headers().
+void toCHeaders(const Envoy::Http::HeaderMap& hdr_map, envoy_client_headers* out) {
+  size_t count = 0;
+  hdr_map.iterate([&count](const Envoy::Http::HeaderEntry&) {
+    ++count;
+    return Envoy::Http::HeaderMap::Iterate::Continue;
+  });
+  out->count = count;
+  if (count == 0) {
+    out->headers = nullptr;
+    return;
+  }
+  out->headers =
+      static_cast<envoy_client_header*>(calloc(count, sizeof(envoy_client_header)));
+  size_t idx = 0;
+  hdr_map.iterate([&](const Envoy::Http::HeaderEntry& entry) {
+    const auto ks = entry.key().getStringView();
+    const auto vs = entry.value().getStringView();
+    char* key_str = static_cast<char*>(malloc(ks.size() + 1));
+    memcpy(key_str, ks.data(), ks.size());
+    key_str[ks.size()] = '\0';
+    char* val_str = static_cast<char*>(malloc(vs.size() + 1));
+    memcpy(val_str, vs.data(), vs.size());
+    val_str[vs.size()] = '\0';
+    out->headers[idx].key = key_str;
+    out->headers[idx].key_len = ks.size();
+    out->headers[idx].value = val_str;
+    out->headers[idx].value_len = vs.size();
+    ++idx;
+    return Envoy::Http::HeaderMap::Iterate::Continue;
+  });
+}
+
+} // namespace
+
+envoy_client_status
+envoy_client_apply_request_filters(envoy_client_handle handle, const char* cluster_name,
+                                   const envoy_client_headers* in_headers,
+                                   envoy_client_headers* out_headers) {
+  if (handle == nullptr || cluster_name == nullptr) {
+    return ENVOY_CLIENT_ERROR;
+  }
+
+  auto hdr_map = fromCHeaders(in_headers);
+  const EnvoyClient::Status status =
+      handle->client->applyRequestFilters(cluster_name, *hdr_map);
+
+  if (status == EnvoyClient::Status::Ok) {
+    if (out_headers != nullptr) {
+      toCHeaders(*hdr_map, out_headers);
+    }
+    return ENVOY_CLIENT_OK;
+  }
+  return ENVOY_CLIENT_DENIED;
+}
+
+envoy_client_status
+envoy_client_apply_response_filters(envoy_client_handle handle, const char* cluster_name,
+                                    const envoy_client_headers* in_headers,
+                                    envoy_client_headers* out_headers) {
+  if (handle == nullptr || cluster_name == nullptr) {
+    return ENVOY_CLIENT_ERROR;
+  }
+
+  auto hdr_map = fromCResponseHeaders(in_headers);
+  const EnvoyClient::Status status =
+      handle->client->applyResponseFilters(cluster_name, *hdr_map);
+
+  if (status == EnvoyClient::Status::Ok) {
+    if (out_headers != nullptr) {
+      toCHeaders(*hdr_map, out_headers);
+    }
+    return ENVOY_CLIENT_OK;
+  }
+  return ENVOY_CLIENT_DENIED;
+}
+
+void envoy_client_free_headers(envoy_client_headers* headers) {
+  if (headers == nullptr || headers->headers == nullptr) {
+    return;
+  }
+  for (size_t i = 0; i < headers->count; ++i) {
+    free(const_cast<char*>(headers->headers[i].key));
+    free(const_cast<char*>(headers->headers[i].value));
+  }
+  free(headers->headers);
+  headers->headers = nullptr;
+  headers->count = 0;
 }
 
 envoy_client_status envoy_client_set_lb_context_provider(envoy_client_handle handle,
