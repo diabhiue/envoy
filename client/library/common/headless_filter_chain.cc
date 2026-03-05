@@ -57,6 +57,7 @@ public:
     class ChainFactoryCallbacks : public Http::FilterChainFactoryCallbacks {
     public:
       explicit ChainFactoryCallbacks(ActiveRequest& req) : req_(req) {}
+
       void addStreamDecoderFilter(Http::StreamDecoderFilterSharedPtr filter) override {
         filter->setDecoderFilterCallbacks(req_);
         req_.filters_.push_back(std::move(filter));
@@ -68,8 +69,22 @@ public:
       }
       void addAccessLogHandler(AccessLog::InstanceSharedPtr) override {}
 
+      // Required by FilterChainFactoryCallbacks.
+      Event::Dispatcher& dispatcher() override { return req_.chain_.dispatcher_; }
+      absl::string_view filterConfigName() const override { return filter_config_name_; }
+      void setFilterConfigName(absl::string_view name) override { filter_config_name_ = name; }
+      OptRef<const Router::Route> route() const override { return {}; }
+      absl::optional<bool> filterDisabled(absl::string_view) const override {
+        return absl::nullopt;
+      }
+      const StreamInfo::StreamInfo& streamInfo() const override { return req_.stream_info_; }
+      Http::RequestHeaderMapOptRef requestHeaders() const override {
+        return req_.headers_ ? makeOptRef(*req_.headers_) : Http::RequestHeaderMapOptRef{};
+      }
+
     private:
       ActiveRequest& req_;
+      std::string filter_config_name_;
     };
     ChainFactoryCallbacks cbs(*this);
     for (const auto& entry : chain_.filter_factories_) {
