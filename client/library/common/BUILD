@@ -20,7 +20,7 @@ envoy_cc_library(
         "//envoy/http:header_map_interface",
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/common:logger_lib",
-        "//source/common/common:scope_tracked_object_stack_lib",
+        "//source/common/common:scope_tracked_object_stack",
         "//source/common/http:header_map_lib",
         "//source/common/stream_info:stream_info_lib",
         "//source/common/tracing:null_span_lib",

@@ -45,3 +45,17 @@ envoy_cc_test(
         "//source/common/http:header_map_lib",
     ],
 )
+
+envoy_cc_test(
+    name = "headless_filter_chain_test",
+    srcs = ["headless_filter_chain_test.cc"],
+    repository = "@envoy",
+    deps = [
+        "//client/library/common:headless_filter_chain_lib",
+        "//source/common/event:real_time_system_lib",
+        "//source/common/http:header_map_lib",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/upstream:cluster_manager_mocks",
+    ],
+)
