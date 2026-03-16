@@ -86,9 +86,33 @@ public:
       ActiveRequest& req_;
       std::string filter_config_name_;
     };
+
     ChainFactoryCallbacks cbs(*this);
-    for (const auto& entry : chain_.filter_factories_) {
-      entry.factory(cbs);
+    const auto& client_ffs = chain_.client_filter_factories_;
+    const auto& server_ffs = chain_.filter_factories_;
+
+    auto invoke_group = [&cbs](const auto& group) {
+      for (const auto& entry : group) {
+        entry.factory(cbs);
+      }
+    };
+
+    switch (chain_.merge_policy_) {
+    case FilterMergePolicy::ClientWrapsServer:
+    case FilterMergePolicy::ClientBeforeServer:
+      invoke_group(client_ffs);
+      invoke_group(server_ffs);
+      break;
+    case FilterMergePolicy::ServerBeforeClient:
+      invoke_group(server_ffs);
+      invoke_group(client_ffs);
+      break;
+    case FilterMergePolicy::ClientOnly:
+      invoke_group(client_ffs);
+      break;
+    case FilterMergePolicy::ServerOnly:
+      invoke_group(server_ffs);
+      break;
     }
   }
 
@@ -278,7 +302,18 @@ HeadlessFilterChain::~HeadlessFilterChain() = default;
 
 void HeadlessFilterChain::addFilterFactory(const std::string& name, Http::FilterFactoryCb factory) {
   filter_factories_.push_back({name, std::move(factory)});
-  ENVOY_LOG(debug, "client: registered filter factory '{}'", name);
+  ENVOY_LOG(debug, "client: registered server filter factory '{}'", name);
+}
+
+void HeadlessFilterChain::addClientFilterFactory(const std::string& name,
+                                                  Http::FilterFactoryCb factory) {
+  client_filter_factories_.push_back({name, std::move(factory)});
+  ENVOY_LOG(debug, "client: registered client filter factory '{}'", name);
+}
+
+void HeadlessFilterChain::setFilterMergePolicy(FilterMergePolicy policy) {
+  merge_policy_ = policy;
+  ENVOY_LOG(debug, "client: set filter merge policy {}", static_cast<uint32_t>(policy));
 }
 
 void HeadlessFilterChain::addInterceptor(ClientInterceptor interceptor) {
@@ -355,7 +390,19 @@ void HeadlessFilterChain::applyRequestFilters(const std::string& cluster_name,
     return;
   }
 
-  if (!filter_factories_.empty()) {
+  // Determine whether any native filters will run under the current merge policy.
+  const bool has_native_filters = [this]() -> bool {
+    switch (merge_policy_) {
+    case FilterMergePolicy::ClientOnly:
+      return !client_filter_factories_.empty();
+    case FilterMergePolicy::ServerOnly:
+      return !filter_factories_.empty();
+    default:
+      return !filter_factories_.empty() || !client_filter_factories_.empty();
+    }
+  }();
+
+  if (has_native_filters) {
     // Wrap the user callback to run POST_REQUEST interceptors after the native chain.
     auto wrap_cb = [snapshot, cluster_name, original_cb = std::move(cb),
                     this](FilterChainResult result,

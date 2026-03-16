@@ -41,6 +41,34 @@ enum class InterceptorPhase : uint32_t {
 };
 
 /**
+ * Controls how client-injected native filters are ordered relative to
+ * server-pushed native filters (from LDS/ECDS) in the filter chain.
+ *
+ * | Policy             | Execution order                          |
+ * |--------------------|------------------------------------------|
+ * | ClientBeforeServer | client filters → server filters          |
+ * | ServerBeforeClient | server filters → client filters          |
+ * | ClientWrapsServer  | client filters → server filters → client |
+ *                        (same as ClientBeforeServer until server  |
+ *                         filters are pushed via LDS/ECDS)        |
+ * | ClientOnly         | only client filters (server ignored)     |
+ * | ServerOnly         | only server filters (client ignored)     |
+ *
+ * The default is ClientWrapsServer, which matches the interceptor behaviour
+ * (pre-request interceptors already run before the native chain, post-request
+ * interceptors after).  For native filters ClientWrapsServer is identical to
+ * ClientBeforeServer until a separate "post-server" client filter group is
+ * introduced.
+ */
+enum class FilterMergePolicy {
+  ClientWrapsServer,   // default
+  ClientBeforeServer,
+  ServerBeforeClient,
+  ClientOnly,
+  ServerOnly,
+};
+
+/**
  * A client interceptor.
  *
  * An interceptor is a lightweight C++ hook that runs before and after the
@@ -86,7 +114,8 @@ using ResponseFilterCompletionCb =
  *
  * Thread safety:
  *   - addInterceptor / removeInterceptor may be called from any thread.
- *   - addFilterFactory must be called from the engine's dispatcher thread.
+ *   - addFilterFactory / addClientFilterFactory / setFilterMergePolicy must be
+ *     called from the engine's dispatcher thread.
  *   - applyRequestFilters / applyResponseFilters must be called from the
  *     engine's dispatcher thread (because filters use the dispatcher).
  */
@@ -99,12 +128,29 @@ public:
   ~HeadlessFilterChain();
 
   /**
-   * Add an Envoy native filter factory. The factory is called once per request
-   * to create a filter instance. Thread: must be called on the dispatcher thread.
+   * Add a server-side native filter factory (e.g. from LDS/ECDS config).
+   * Thread: must be called on the dispatcher thread.
    * @param name a human-readable name for logging.
    * @param factory the filter factory callback.
    */
   void addFilterFactory(const std::string& name, Http::FilterFactoryCb factory);
+
+  /**
+   * Add a client-side native filter factory (injected by the application via
+   * addNativeFilter). Placement relative to server filters is controlled by
+   * the active FilterMergePolicy.
+   * Thread: must be called on the dispatcher thread.
+   * @param name a human-readable name for logging.
+   * @param factory the filter factory callback.
+   */
+  void addClientFilterFactory(const std::string& name, Http::FilterFactoryCb factory);
+
+  /**
+   * Set the merge policy that controls ordering of client vs server native
+   * filters. Defaults to FilterMergePolicy::ClientWrapsServer.
+   * Thread: must be called on the dispatcher thread.
+   */
+  void setFilterMergePolicy(FilterMergePolicy policy);
 
   /**
    * Add or replace a client interceptor. Safe to call from any thread.
@@ -146,9 +192,14 @@ public:
                             ResponseFilterCompletionCb cb);
 
   /**
-   * @return the number of registered native filter factories.
+   * @return the number of registered server-side native filter factories.
    */
   size_t filterFactoryCount() const { return filter_factories_.size(); }
+
+  /**
+   * @return the number of registered client-side native filter factories.
+   */
+  size_t clientFilterFactoryCount() const { return client_filter_factories_.size(); }
 
   /**
    * @return the number of registered interceptors.
@@ -199,7 +250,12 @@ private:
     std::string name;
     Http::FilterFactoryCb factory;
   };
+  // Server-side filter factories (from LDS/ECDS config).
   std::vector<FilterFactoryEntry> filter_factories_;
+  // Client-side filter factories (injected via addClientFilterFactory / addNativeFilter).
+  std::vector<FilterFactoryEntry> client_filter_factories_;
+  // Controls how client and server filter factories are ordered. Dispatcher thread only.
+  FilterMergePolicy merge_policy_{FilterMergePolicy::ClientWrapsServer};
 
   // Interceptors. Protected by interceptors_mutex_ for cross-thread add/remove.
   mutable absl::Mutex interceptors_mutex_;

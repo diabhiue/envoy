@@ -153,6 +153,26 @@ public:
   void removeInterceptor(const std::string& name);
 
   /**
+   * Inject a client-side native Envoy filter into the request pipeline.
+   * The filter is instantiated once per request via the factory callback.
+   * Thread-safe: posts to the engine's dispatcher thread and waits.
+   *
+   * Placement relative to server-pushed filters is controlled by the active
+   * FilterMergePolicy (default: ClientWrapsServer = run before server filters).
+   *
+   * @param name  human-readable name for logging.
+   * @param factory  callback that creates and registers the filter instance.
+   */
+  void addNativeFilter(const std::string& name, Envoy::Http::FilterFactoryCb factory);
+
+  /**
+   * Control how client-injected native filters are ordered relative to
+   * server-pushed native filters.  Default: ClientWrapsServer.
+   * Thread-safe: posts to the engine's dispatcher thread and waits.
+   */
+  void setFilterMergePolicy(Envoy::Client::FilterMergePolicy policy);
+
+  /**
    * Apply the request filter pipeline (interceptors + native filter chain) to
    * request headers. Blocks until the pipeline completes (including async filters).
    * The headers are modified in-place by the filter chain.
@@ -161,7 +181,8 @@ public:
    * @param headers request headers to process; modified in-place on Allow.
    * @return Status::Ok if allowed, Status::Denied if any filter/interceptor denied.
    */
-  Status applyRequestFilters(const std::string& cluster_name, Http::RequestHeaderMap& headers);
+  Status applyRequestFilters(const std::string& cluster_name,
+                             Envoy::Http::RequestHeaderMap& headers);
 
   /**
    * Apply the response filter pipeline to response headers.
@@ -170,7 +191,8 @@ public:
    * @param headers response headers to process; modified in-place on Allow.
    * @return Status::Ok if allowed, Status::Denied if any filter/interceptor denied.
    */
-  Status applyResponseFilters(const std::string& cluster_name, Http::ResponseHeaderMap& headers);
+  Status applyResponseFilters(const std::string& cluster_name,
+                              Envoy::Http::ResponseHeaderMap& headers);
 
   /**
    * Shut down the client engine.

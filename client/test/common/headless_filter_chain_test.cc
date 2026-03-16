@@ -460,6 +460,155 @@ TEST_F(HeadlessFilterChainTest, ResponseInterceptorAllowsAndModifiesHeaders) {
   EXPECT_EQ(vals[0]->value().getStringView(), "ok");
 }
 
+// ---------------------------------------------------------------------------
+// FilterMergePolicy tests
+//
+// All tests use TagFilter to record execution order via x-tag headers.
+// "client" factories are added via addClientFilterFactory().
+// "server" factories are added via addFilterFactory().
+// ---------------------------------------------------------------------------
+
+TEST_F(HeadlessFilterChainTest, DefaultPolicyClientBeforeServer) {
+  // Default policy = ClientWrapsServer, treated as ClientBeforeServer for native filters.
+  chain_.addClientFilterFactory("c1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client"));
+  });
+  chain_.addFilterFactory("s1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("server"));
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Allow);
+  ASSERT_NE(r.headers, nullptr);
+  auto tags = r.headers->get(Http::LowerCaseString("x-tag"));
+  ASSERT_EQ(tags.size(), 2u);
+  EXPECT_EQ(tags[0]->value().getStringView(), "client");
+  EXPECT_EQ(tags[1]->value().getStringView(), "server");
+}
+
+TEST_F(HeadlessFilterChainTest, PolicyClientBeforeServerExplicit) {
+  chain_.setFilterMergePolicy(FilterMergePolicy::ClientBeforeServer);
+  chain_.addClientFilterFactory("c1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client"));
+  });
+  chain_.addFilterFactory("s1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("server"));
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Allow);
+  auto tags = r.headers->get(Http::LowerCaseString("x-tag"));
+  ASSERT_EQ(tags.size(), 2u);
+  EXPECT_EQ(tags[0]->value().getStringView(), "client");
+  EXPECT_EQ(tags[1]->value().getStringView(), "server");
+}
+
+TEST_F(HeadlessFilterChainTest, PolicyServerBeforeClient) {
+  chain_.setFilterMergePolicy(FilterMergePolicy::ServerBeforeClient);
+  chain_.addClientFilterFactory("c1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client"));
+  });
+  chain_.addFilterFactory("s1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("server"));
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Allow);
+  auto tags = r.headers->get(Http::LowerCaseString("x-tag"));
+  ASSERT_EQ(tags.size(), 2u);
+  EXPECT_EQ(tags[0]->value().getStringView(), "server");
+  EXPECT_EQ(tags[1]->value().getStringView(), "client");
+}
+
+TEST_F(HeadlessFilterChainTest, PolicyClientOnly) {
+  chain_.setFilterMergePolicy(FilterMergePolicy::ClientOnly);
+  chain_.addClientFilterFactory("c1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client"));
+  });
+  chain_.addFilterFactory("s1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("server"));
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Allow);
+  auto tags = r.headers->get(Http::LowerCaseString("x-tag"));
+  ASSERT_EQ(tags.size(), 1u);
+  EXPECT_EQ(tags[0]->value().getStringView(), "client");
+}
+
+TEST_F(HeadlessFilterChainTest, PolicyServerOnly) {
+  chain_.setFilterMergePolicy(FilterMergePolicy::ServerOnly);
+  chain_.addClientFilterFactory("c1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client"));
+  });
+  chain_.addFilterFactory("s1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("server"));
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Allow);
+  auto tags = r.headers->get(Http::LowerCaseString("x-tag"));
+  ASSERT_EQ(tags.size(), 1u);
+  EXPECT_EQ(tags[0]->value().getStringView(), "server");
+}
+
+TEST_F(HeadlessFilterChainTest, ClientFilterFactoryCountIsIndependent) {
+  EXPECT_EQ(chain_.filterFactoryCount(), 0u);
+  EXPECT_EQ(chain_.clientFilterFactoryCount(), 0u);
+
+  chain_.addFilterFactory("s1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<SyncPassFilter>());
+  });
+  EXPECT_EQ(chain_.filterFactoryCount(), 1u);
+  EXPECT_EQ(chain_.clientFilterFactoryCount(), 0u);
+
+  chain_.addClientFilterFactory("c1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<SyncPassFilter>());
+  });
+  EXPECT_EQ(chain_.filterFactoryCount(), 1u);
+  EXPECT_EQ(chain_.clientFilterFactoryCount(), 1u);
+}
+
+TEST_F(HeadlessFilterChainTest, PolicyClientOnlyWithNoClientFiltersAllows) {
+  // ClientOnly policy + only server filters registered → no filters run → Allow.
+  chain_.setFilterMergePolicy(FilterMergePolicy::ClientOnly);
+  chain_.addFilterFactory("s1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<SyncDenyFilter>());
+  });
+
+  auto r = applyRequest();
+  // Server deny filter is skipped because policy is ClientOnly.
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Allow);
+}
+
+TEST_F(HeadlessFilterChainTest, PolicyServerOnlyWithNoServerFiltersAllows) {
+  // ServerOnly policy + only client filters registered → no filters run → Allow.
+  chain_.setFilterMergePolicy(FilterMergePolicy::ServerOnly);
+  chain_.addClientFilterFactory("c1", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<SyncDenyFilter>());
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Allow);
+}
+
+TEST_F(HeadlessFilterChainTest, ClientDenyFilterShortCircuitsBeforeServer) {
+  // ClientBeforeServer: client deny filter prevents server filter from running.
+  chain_.setFilterMergePolicy(FilterMergePolicy::ClientBeforeServer);
+  chain_.addClientFilterFactory("deny", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<SyncDenyFilter>());
+  });
+  chain_.addFilterFactory("tag_s", [](Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("server"));
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.chain_result.status, FilterChainResult::Status::Deny);
+  // Server tag filter never ran → no x-tag header.
+  auto tags = r.headers->get(Http::LowerCaseString("x-tag"));
+  EXPECT_TRUE(tags.empty());
+}
+
 } // namespace
 } // namespace Client
 } // namespace Envoy

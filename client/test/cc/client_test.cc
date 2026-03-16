@@ -1,7 +1,12 @@
 #include "client/library/cc/client.h"
 
+#include "client/library/common/headless_filter_chain.h"
+#include "source/common/event/real_time_system.h"
+#include "source/common/http/header_map_impl.h"
 #include "source/common/network/utility.h"
+#include "source/extensions/filters/http/common/pass_through_filter.h"
 
+#include "test/mocks/event/mocks.h"
 #include "test/mocks/upstream/cluster_manager.h"
 #include "test/mocks/upstream/host.h"
 #include "test/mocks/upstream/host_set.h"
@@ -290,6 +295,172 @@ TEST_F(ClientTest, ShutdownIsIdempotentWhenAlreadyTerminated) {
   EXPECT_CALL(*engine_, terminate()).Times(0);
   client_->shutdown();
   client_->shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// addNativeFilter / setFilterMergePolicy tests
+//
+// Uses a test engine that holds a real HeadlessFilterChain backed by mock
+// dispatcher and cluster manager.
+// ---------------------------------------------------------------------------
+
+// A minimal filter that appends a tag to "x-tag" header.
+class TagFilter : public Envoy::Http::PassThroughDecoderFilter {
+public:
+  explicit TagFilter(std::string tag) : tag_(std::move(tag)) {}
+  Envoy::Http::FilterHeadersStatus decodeHeaders(Envoy::Http::RequestHeaderMap& headers,
+                                                  bool end_stream) override {
+    headers.addCopy(Envoy::Http::LowerCaseString("x-tag"), tag_);
+    return Envoy::Http::PassThroughDecoderFilter::decodeHeaders(headers, end_stream);
+  }
+
+private:
+  std::string tag_;
+};
+
+class TestEngineWithFilterChain : public Envoy::Client::ClientEngineInterface {
+public:
+  TestEngineWithFilterChain(Envoy::Event::Dispatcher& dispatcher,
+                             Envoy::Upstream::ClusterManager& cm,
+                             Envoy::TimeSource& time_source,
+                             Envoy::Client::ConfigStore& store)
+      : store_(store),
+        filter_chain_(
+            std::make_unique<Envoy::Client::HeadlessFilterChain>(dispatcher, cm, time_source)) {}
+
+  bool waitReady(absl::Duration) override { return true; }
+  void terminate() override {}
+  bool isTerminated() const override { return false; }
+  Envoy::Client::ConfigStore& configStore() override { return store_; }
+  Envoy::Client::HeadlessFilterChain* filterChain() override { return filter_chain_.get(); }
+
+  Envoy::Client::HeadlessFilterChain& chain() { return *filter_chain_; }
+
+private:
+  Envoy::Client::ConfigStore& store_;
+  std::unique_ptr<Envoy::Client::HeadlessFilterChain> filter_chain_;
+};
+
+class ClientFilterChainTest : public testing::Test {
+public:
+  ClientFilterChainTest() : config_store_(cm_) {
+    auto engine = std::make_unique<TestEngineWithFilterChain>(dispatcher_, cm_, time_system_,
+                                                              config_store_);
+    engine_ = engine.get();
+    client_ = Client::createForTesting(std::move(engine));
+  }
+
+  // Run applyRequestFilters on a fresh set of GET / headers, return result.
+  struct ApplyResult {
+    Status status;
+    std::vector<std::string> tags; // values of x-tag after processing
+  };
+
+  ApplyResult applyRequest() {
+    auto headers = Envoy::Http::RequestHeaderMapImpl::create();
+    headers->setMethod("GET");
+    headers->setPath("/test");
+    headers->setHost("example.com");
+
+    Status s = client_->applyRequestFilters("test_cluster", *headers);
+    ApplyResult r;
+    r.status = s;
+    auto vals = headers->get(Envoy::Http::LowerCaseString("x-tag"));
+    for (size_t i = 0; i < vals.size(); ++i) {
+      r.tags.emplace_back(vals[i]->value().getStringView());
+    }
+    return r;
+  }
+
+  NiceMock<Envoy::Event::MockDispatcher> dispatcher_;
+  NiceMock<Envoy::Upstream::MockClusterManager> cm_;
+  Envoy::Event::RealTimeSystem time_system_;
+  Envoy::Client::ConfigStore config_store_;
+  TestEngineWithFilterChain* engine_{nullptr}; // owned by client_
+  std::unique_ptr<Client> client_;
+};
+
+TEST_F(ClientFilterChainTest, AddNativeFilterRunsInRequestPipeline) {
+  client_->addNativeFilter("tag_c", [](Envoy::Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client_filter"));
+  });
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.status, Status::Ok);
+  ASSERT_EQ(r.tags.size(), 1u);
+  EXPECT_EQ(r.tags[0], "client_filter");
+}
+
+TEST_F(ClientFilterChainTest, AddNativeFilterCountsAsClientFilter) {
+  EXPECT_EQ(engine_->chain().clientFilterFactoryCount(), 0u);
+
+  client_->addNativeFilter("f1", [](Envoy::Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("f1"));
+  });
+
+  EXPECT_EQ(engine_->chain().clientFilterFactoryCount(), 1u);
+  EXPECT_EQ(engine_->chain().filterFactoryCount(), 0u); // server count unchanged
+}
+
+TEST_F(ClientFilterChainTest, SetFilterMergePolicyServerBeforeClient) {
+  // Add a server-side factory directly on the filter chain.
+  engine_->chain().addFilterFactory("s1", [](Envoy::Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("server"));
+  });
+  // Add a client-side factory via the Client API.
+  client_->addNativeFilter("c1", [](Envoy::Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client"));
+  });
+
+  client_->setFilterMergePolicy(Envoy::Client::FilterMergePolicy::ServerBeforeClient);
+
+  auto r = applyRequest();
+  EXPECT_EQ(r.status, Status::Ok);
+  ASSERT_EQ(r.tags.size(), 2u);
+  EXPECT_EQ(r.tags[0], "server");
+  EXPECT_EQ(r.tags[1], "client");
+}
+
+TEST_F(ClientFilterChainTest, SetFilterMergePolicyClientOnly) {
+  engine_->chain().addFilterFactory("s1", [](Envoy::Http::FilterChainFactoryCallbacks& cbs) {
+    // Server filter that would deny — should be skipped.
+    class DenyFilter : public Envoy::Http::PassThroughDecoderFilter {
+    public:
+      Envoy::Http::FilterHeadersStatus decodeHeaders(Envoy::Http::RequestHeaderMap&,
+                                                     bool) override {
+        decoder_callbacks_->sendLocalReply(Envoy::Http::Code::Forbidden, "", nullptr,
+                                           absl::nullopt, "");
+        return Envoy::Http::FilterHeadersStatus::StopIteration;
+      }
+    };
+    cbs.addStreamDecoderFilter(std::make_shared<DenyFilter>());
+  });
+  client_->addNativeFilter("c1", [](Envoy::Http::FilterChainFactoryCallbacks& cbs) {
+    cbs.addStreamDecoderFilter(std::make_shared<TagFilter>("client"));
+  });
+
+  client_->setFilterMergePolicy(Envoy::Client::FilterMergePolicy::ClientOnly);
+
+  auto r = applyRequest();
+  // Server deny filter was skipped; only client filter ran.
+  EXPECT_EQ(r.status, Status::Ok);
+  ASSERT_EQ(r.tags.size(), 1u);
+  EXPECT_EQ(r.tags[0], "client");
+}
+
+TEST_F(ClientFilterChainTest, AddNativeFilterWithNullFilterChainIsNoop) {
+  // MockClientEngine returns nullptr for filterChain() — addNativeFilter must not crash.
+  auto mock_engine = std::make_unique<NiceMock<MockClientEngine>>(cm_);
+  auto client_no_chain = Client::createForTesting(std::move(mock_engine));
+  // Should not crash.
+  EXPECT_NO_THROW(client_no_chain->addNativeFilter("noop", [](Envoy::Http::FilterChainFactoryCallbacks&) {}));
+}
+
+TEST_F(ClientFilterChainTest, SetFilterMergePolicyWithNullFilterChainIsNoop) {
+  auto mock_engine = std::make_unique<NiceMock<MockClientEngine>>(cm_);
+  auto client_no_chain = Client::createForTesting(std::move(mock_engine));
+  EXPECT_NO_THROW(client_no_chain->setFilterMergePolicy(
+      Envoy::Client::FilterMergePolicy::ClientBeforeServer));
 }
 
 } // namespace

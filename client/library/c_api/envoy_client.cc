@@ -6,6 +6,79 @@
 #include "envoy/http/header_map.h"
 #include "source/common/http/header_map_impl.h"
 
+// ---------------------------------------------------------------------------
+// Internal C++ helpers — must live outside extern "C" to avoid the
+// -Wreturn-type-c-linkage warning for functions returning C++ types.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Convert envoy_client_headers to Http::RequestHeaderMap.
+Envoy::Http::RequestHeaderMapPtr fromCHeaders(const envoy_client_headers* in_headers) {
+  auto hdr_map = Envoy::Http::RequestHeaderMapImpl::create();
+  if (in_headers != nullptr) {
+    for (size_t i = 0; i < in_headers->count; ++i) {
+      const auto& h = in_headers->headers[i];
+      if (h.key && h.value) {
+        hdr_map->addCopy(Envoy::Http::LowerCaseString(std::string(h.key, h.key_len)),
+                         std::string(h.value, h.value_len));
+      }
+    }
+  }
+  return hdr_map;
+}
+
+// Convert envoy_client_headers to Http::ResponseHeaderMap.
+Envoy::Http::ResponseHeaderMapPtr fromCResponseHeaders(const envoy_client_headers* in_headers) {
+  auto hdr_map = Envoy::Http::ResponseHeaderMapImpl::create();
+  if (in_headers != nullptr) {
+    for (size_t i = 0; i < in_headers->count; ++i) {
+      const auto& h = in_headers->headers[i];
+      if (h.key && h.value) {
+        hdr_map->addCopy(Envoy::Http::LowerCaseString(std::string(h.key, h.key_len)),
+                         std::string(h.value, h.value_len));
+      }
+    }
+  }
+  return hdr_map;
+}
+
+// Populate an envoy_client_headers struct from an Http::HeaderMap.
+// Allocates memory that the caller must free with envoy_client_free_headers().
+void toCHeaders(const Envoy::Http::HeaderMap& hdr_map, envoy_client_headers* out) {
+  size_t count = 0;
+  hdr_map.iterate([&count](const Envoy::Http::HeaderEntry&) {
+    ++count;
+    return Envoy::Http::HeaderMap::Iterate::Continue;
+  });
+  out->count = count;
+  if (count == 0) {
+    out->headers = nullptr;
+    return;
+  }
+  out->headers =
+      static_cast<envoy_client_header*>(calloc(count, sizeof(envoy_client_header)));
+  size_t idx = 0;
+  hdr_map.iterate([&](const Envoy::Http::HeaderEntry& entry) {
+    const auto ks = entry.key().getStringView();
+    const auto vs = entry.value().getStringView();
+    char* key_str = static_cast<char*>(malloc(ks.size() + 1));
+    memcpy(key_str, ks.data(), ks.size());
+    key_str[ks.size()] = '\0';
+    char* val_str = static_cast<char*>(malloc(vs.size() + 1));
+    memcpy(val_str, vs.data(), vs.size());
+    val_str[vs.size()] = '\0';
+    out->headers[idx].key = key_str;
+    out->headers[idx].key_len = ks.size();
+    out->headers[idx].value = val_str;
+    out->headers[idx].value_len = vs.size();
+    ++idx;
+    return Envoy::Http::HeaderMap::Iterate::Continue;
+  });
+}
+
+} // namespace
+
 extern "C" {
 
 envoy_client_handle envoy_client_create(const char* bootstrap_config, size_t config_len) {
@@ -287,74 +360,6 @@ envoy_client_status envoy_client_remove_interceptor(envoy_client_handle handle,
 }
 
 // --- Filter Application ---
-
-namespace {
-
-// Convert envoy_client_headers to Http::RequestHeaderMap.
-Envoy::Http::RequestHeaderMapPtr fromCHeaders(const envoy_client_headers* in_headers) {
-  auto hdr_map = Envoy::Http::RequestHeaderMapImpl::create();
-  if (in_headers != nullptr) {
-    for (size_t i = 0; i < in_headers->count; ++i) {
-      const auto& h = in_headers->headers[i];
-      if (h.key && h.value) {
-        hdr_map->addCopy(Envoy::Http::LowerCaseString(std::string(h.key, h.key_len)),
-                         std::string(h.value, h.value_len));
-      }
-    }
-  }
-  return hdr_map;
-}
-
-// Convert envoy_client_headers to Http::ResponseHeaderMap.
-Envoy::Http::ResponseHeaderMapPtr fromCResponseHeaders(const envoy_client_headers* in_headers) {
-  auto hdr_map = Envoy::Http::ResponseHeaderMapImpl::create();
-  if (in_headers != nullptr) {
-    for (size_t i = 0; i < in_headers->count; ++i) {
-      const auto& h = in_headers->headers[i];
-      if (h.key && h.value) {
-        hdr_map->addCopy(Envoy::Http::LowerCaseString(std::string(h.key, h.key_len)),
-                         std::string(h.value, h.value_len));
-      }
-    }
-  }
-  return hdr_map;
-}
-
-// Populate an envoy_client_headers struct from an Http::HeaderMap.
-// Allocates memory that the caller must free with envoy_client_free_headers().
-void toCHeaders(const Envoy::Http::HeaderMap& hdr_map, envoy_client_headers* out) {
-  size_t count = 0;
-  hdr_map.iterate([&count](const Envoy::Http::HeaderEntry&) {
-    ++count;
-    return Envoy::Http::HeaderMap::Iterate::Continue;
-  });
-  out->count = count;
-  if (count == 0) {
-    out->headers = nullptr;
-    return;
-  }
-  out->headers =
-      static_cast<envoy_client_header*>(calloc(count, sizeof(envoy_client_header)));
-  size_t idx = 0;
-  hdr_map.iterate([&](const Envoy::Http::HeaderEntry& entry) {
-    const auto ks = entry.key().getStringView();
-    const auto vs = entry.value().getStringView();
-    char* key_str = static_cast<char*>(malloc(ks.size() + 1));
-    memcpy(key_str, ks.data(), ks.size());
-    key_str[ks.size()] = '\0';
-    char* val_str = static_cast<char*>(malloc(vs.size() + 1));
-    memcpy(val_str, vs.data(), vs.size());
-    val_str[vs.size()] = '\0';
-    out->headers[idx].key = key_str;
-    out->headers[idx].key_len = ks.size();
-    out->headers[idx].value = val_str;
-    out->headers[idx].value_len = vs.size();
-    ++idx;
-    return Envoy::Http::HeaderMap::Iterate::Continue;
-  });
-}
-
-} // namespace
 
 envoy_client_status
 envoy_client_apply_request_filters(envoy_client_handle handle, const char* cluster_name,
